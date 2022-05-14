@@ -16,11 +16,11 @@ func KLineTypicalPriceMapper(k types.KLine) float64 {
 	return (k.High.Float64() + k.Low.Float64() + k.Close.Float64()) / 3.
 }
 
-func MapKLinePrice(kLines []types.KLine, f KLinePriceMapper) (prices []float64) {
-	for _, k := range kLines {
-		prices = append(prices, f(k))
+func MapKLinePrice(kLines []types.KLine, f KLinePriceMapper) []float64 {
+	var prices = make([]float64, len(kLines))
+	for index := 0; index < len(kLines); index++ {
+		prices[index] = f(kLines[index])
 	}
-
 	return prices
 }
 
