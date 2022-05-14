@@ -195,11 +195,13 @@ To query transfer history:
 bbgo transfer-history --session max --asset USDT --since "2019-01-01"
 ```
 
+<!--
 To calculate pnl:
 
 ```sh
 bbgo pnl --exchange binance --asset BTC --since "2019-01-01"
 ```
+--->
 
 
 ## Advanced Configuration
@@ -226,6 +228,10 @@ loss correctly.
 By synchronizing trades and orders to the local database, you can earn some benefits like PnL calculations, backtesting
 and asset calculation.
 
+You can only use one database driver MySQL or SQLite to store your trading data.
+
+**Notice**: SQLite is not fully supported, we recommend you use MySQL instead of SQLite.
+
 #### Configure MySQL Database
 
 To use MySQL database for data syncing, first you need to install your mysql server:
@@ -233,6 +239,9 @@ To use MySQL database for data syncing, first you need to install your mysql ser
 ```sh
 # For Ubuntu Linux
 sudo apt-get install -y mysql-server
+
+# For newer Ubuntu Linux
+sudo apt install -y mysql-server
 ```
 
 Or [run it in docker](https://hub.docker.com/_/mysql)
@@ -252,7 +261,7 @@ DB_DSN="user:password@tcp(127.0.0.1:3306)/bbgo"
 
 #### Configure Sqlite3 Database
 
-Just put these environment variables in your `.env.local` file:
+To use SQLite3 instead of MySQL, simply put these environment variables in your `.env.local` file:
 
 ```sh
 DB_DRIVER=sqlite3
@@ -272,6 +281,9 @@ To use Redis, first you need to install your Redis server:
 ```sh
 # For Ubuntu/Debian Linux
 sudo apt-get install -y redis
+
+# For newer Ubuntu/Debian Linux
+sudo apt install -y redis
 ```
 
 Set the following environment variables in your `bbgo.yaml`:
