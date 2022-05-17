@@ -1,20 +1,37 @@
 package backtest
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/c9s/bbgo/pkg/accounting/pnl"
+	"github.com/c9s/bbgo/pkg/bbgo"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
+	"github.com/c9s/bbgo/pkg/util"
 )
+
+type Run struct {
+	ID     string       `json:"id"`
+	Config *bbgo.Config `json:"config"`
+	Time   time.Time    `json:"time"`
+}
+
+type ReportIndex struct {
+	Runs []Run `json:"runs,omitempty"`
+}
 
 // SummaryReport is the summary of the back-test session
 type SummaryReport struct {
 	StartTime            time.Time        `json:"startTime"`
 	EndTime              time.Time        `json:"endTime"`
 	Sessions             []string         `json:"sessions"`
+	Symbols              []string         `json:"symbols"`
 	InitialTotalBalances types.BalanceMap `json:"initialTotalBalances"`
 	FinalTotalBalances   types.BalanceMap `json:"finalTotalBalances"`
 }
@@ -24,7 +41,9 @@ type SummaryReport struct {
 type SessionSymbolReport struct {
 	StartTime       time.Time                 `json:"startTime"`
 	EndTime         time.Time                 `json:"endTime"`
+	Exchange        types.ExchangeName        `json:"exchange"`
 	Symbol          string                    `json:"symbol,omitempty"`
+	Market          types.Market              `json:"market"`
 	LastPrice       fixedpoint.Value          `json:"lastPrice,omitempty"`
 	StartPrice      fixedpoint.Value          `json:"startPrice,omitempty"`
 	PnLReport       *pnl.AverageCostPnlReport `json:"pnlReport,omitempty"`
@@ -43,4 +62,40 @@ func FormatSessionName(sessions []string, symbols []string, startTime, endTime t
 		startTime.Format(SessionTimeFormat),
 		endTime.Format(SessionTimeFormat),
 	)
+}
+
+func WriteReportIndex(outputDirectory string, reportIndex *ReportIndex) error {
+	indexFile := filepath.Join(outputDirectory, "index.json")
+	if err := util.WriteJsonFile(indexFile, reportIndex); err != nil {
+		return err
+	}
+	return nil
+}
+
+func LoadReportIndex(outputDirectory string) (*ReportIndex, error) {
+	var reportIndex ReportIndex
+	indexFile := filepath.Join(outputDirectory, "index.json")
+	if _, err := os.Stat(indexFile); err == nil {
+		o, err := ioutil.ReadFile(indexFile)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := json.Unmarshal(o, &reportIndex); err != nil {
+			return nil, err
+		}
+	}
+
+	return &reportIndex, nil
+}
+
+func AddReportIndexRun(outputDirectory string, run Run) error {
+	// append report index
+	reportIndex, err := LoadReportIndex(outputDirectory)
+	if err != nil {
+		return err
+	}
+
+	reportIndex.Runs = append(reportIndex.Runs, run)
+	return WriteReportIndex(outputDirectory, reportIndex)
 }
