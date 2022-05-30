@@ -357,12 +357,29 @@ func (e *Exchange) SubscribeMarketData(extraIntervals ...types.Interval) (chan t
 
 	log.Infof("using symbols: %v and intervals: %v for back-testing", symbols, intervals)
 	log.Infof("querying klines from database...")
-	klineC, errC := e.srv.QueryKLinesCh(e.startTime, e.endTime, e, symbols, intervals)
+
+	// Cache backtest klines
+	var err error
+	var kline []types.KLine
+	key := fmt.Sprintf("%v-%v-%v-%v-%v-kline", e.startTime.Unix(), e.endTime.Unix(), symbols, intervals, e.sourceName)
+	err = cache.WithCache(key, &kline, func() (interface{}, error) {
+		return e.srv.QueryKLines(e.startTime, e.endTime, e, symbols, intervals)
+	})
+
+	if err != nil {
+		log.WithError(err).Error("backtest data feed error")
+	}
+
+	klineC := make(chan types.KLine, 500)
+
 	go func() {
-		if err := <-errC; err != nil {
-			log.WithError(err).Error("backtest data feed error")
+		defer close(klineC)
+
+		for i := 0; i < len(kline); i++ {
+			klineC <- kline[i]
 		}
 	}()
+
 	return klineC, nil
 }
 

@@ -218,6 +218,38 @@ func (s *BacktestService) QueryKLinesCh(since, until time.Time, exchange types.E
 	return s.scanRowsCh(rows)
 }
 
+func (s *BacktestService) QueryKLines(since, until time.Time, exchange types.Exchange, symbols []string, intervals []types.Interval) ([]types.KLine, error) {
+
+	if len(symbols) == 0 {
+		return nil, errors.Errorf("symbols is empty when querying kline, plesae check your strategy setting. ")
+	}
+
+	tableName := s._targetKlineTable(exchange.Name())
+	sql := "SELECT * FROM `binance_klines` WHERE `end_time` BETWEEN :since AND :until AND `symbol` IN (:symbols) AND `interval` IN (:intervals)  and exchange = :exchange  ORDER BY end_time ASC"
+	sql = strings.ReplaceAll(sql, "binance_klines", tableName)
+
+	sql, args, err := sqlx.Named(sql, map[string]interface{}{
+		"since":     since,
+		"until":     until,
+		"symbols":   symbols,
+		"intervals": types.IntervalSlice(intervals),
+		"exchange":  exchange.Name().String(),
+	})
+
+	sql, args, err = sqlx.In(sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	sql = s.DB.Rebind(sql)
+
+	rows, err := s.DB.Queryx(sql, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.scanRows(rows)
+}
+
 func returnError(err error) (chan types.KLine, chan error) {
 	ch := make(chan types.KLine, 0)
 	close(ch)
