@@ -5,8 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/c9s/bbgo/pkg/exchange/max/maxapi"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
@@ -168,15 +166,9 @@ func toGlobalOrders(maxOrders []max.Order) (orders []types.Order, err error) {
 }
 
 func toGlobalOrder(maxOrder max.Order) (*types.Order, error) {
-	executedVolume, err := fixedpoint.NewFromString(maxOrder.ExecutedVolume)
-	if err != nil {
-		return nil, errors.Wrapf(err, "parse executed_volume failed: %+v", maxOrder)
-	}
-
-	remainingVolume, err := fixedpoint.NewFromString(maxOrder.RemainingVolume)
-	if err != nil {
-		return nil, errors.Wrapf(err, "parse remaining volume failed: %+v", maxOrder)
-	}
+	executedVolume := maxOrder.ExecutedVolume
+	remainingVolume := maxOrder.RemainingVolume
+	isMargin := maxOrder.WalletType == max.WalletTypeMargin
 
 	return &types.Order{
 		SubmitOrder: types.SubmitOrder{
@@ -184,62 +176,43 @@ func toGlobalOrder(maxOrder max.Order) (*types.Order, error) {
 			Symbol:        toGlobalSymbol(maxOrder.Market),
 			Side:          toGlobalSideType(maxOrder.Side),
 			Type:          toGlobalOrderType(maxOrder.OrderType),
-			Quantity:      fixedpoint.MustNewFromString(maxOrder.Volume),
-			Price:         fixedpoint.MustNewFromString(maxOrder.Price),
-			TimeInForce:   "GTC", // MAX only supports GTC
+			Quantity:      maxOrder.Volume,
+			Price:         maxOrder.Price,
+			TimeInForce:   types.TimeInForceGTC, // MAX only supports GTC
 			GroupID:       maxOrder.GroupID,
 		},
 		Exchange:         types.ExchangeMax,
-		IsWorking:        maxOrder.State == "wait",
+		IsWorking:        maxOrder.State == max.OrderStateWait,
 		OrderID:          maxOrder.ID,
 		Status:           toGlobalOrderStatus(maxOrder.State, executedVolume, remainingVolume),
 		ExecutedQuantity: executedVolume,
-		CreationTime:     types.Time(maxOrder.CreatedAtMs.Time()),
-		UpdateTime:       types.Time(maxOrder.CreatedAtMs.Time()),
+		CreationTime:     types.Time(maxOrder.CreatedAt.Time()),
+		UpdateTime:       types.Time(maxOrder.CreatedAt.Time()),
+		IsMargin:         isMargin,
+		IsIsolated:       false, // isolated margin is not supported
 	}, nil
 }
 
 func toGlobalTrade(t max.Trade) (*types.Trade, error) {
-	// skip trade ID that is the same. however this should not happen
-	var side = toGlobalSideType(t.Side)
-
-	// trade time
-	mts := t.CreatedAtMilliSeconds
-
-	price, err := fixedpoint.NewFromString(t.Price)
-	if err != nil {
-		return nil, err
-	}
-
-	quantity, err := fixedpoint.NewFromString(t.Volume)
-	if err != nil {
-		return nil, err
-	}
-
-	quoteQuantity, err := fixedpoint.NewFromString(t.Funds)
-	if err != nil {
-		return nil, err
-	}
-
-	fee, err := fixedpoint.NewFromString(t.Fee)
-	if err != nil {
-		return nil, err
-	}
-
+	isMargin := t.WalletType == max.WalletTypeMargin
+	side := toGlobalSideType(t.Side)
 	return &types.Trade{
 		ID:            t.ID,
 		OrderID:       t.OrderID,
-		Price:         price,
+		Price:         t.Price,
 		Symbol:        toGlobalSymbol(t.Market),
-		Exchange:      "max",
-		Quantity:      quantity,
+		Exchange:      types.ExchangeMax,
+		Quantity:      t.Volume,
 		Side:          side,
 		IsBuyer:       t.IsBuyer(),
 		IsMaker:       t.IsMaker(),
-		Fee:           fee,
+		Fee:           t.Fee,
 		FeeCurrency:   toGlobalCurrency(t.FeeCurrency),
-		QuoteQuantity: quoteQuantity,
-		Time:          types.Time(mts),
+		QuoteQuantity: t.Funds,
+		Time:          types.Time(t.CreatedAt),
+		IsMargin:      isMargin,
+		IsIsolated:    false,
+		IsFutures:     false,
 	}, nil
 }
 
@@ -306,16 +279,6 @@ func convertWebSocketTrade(t max.TradeUpdate) (*types.Trade, error) {
 }
 
 func convertWebSocketOrderUpdate(u max.OrderUpdate) (*types.Order, error) {
-	executedVolume, err := fixedpoint.NewFromString(u.ExecutedVolume)
-	if err != nil {
-		return nil, err
-	}
-
-	remainingVolume, err := fixedpoint.NewFromString(u.RemainingVolume)
-	if err != nil {
-		return nil, err
-	}
-
 	timeInForce := types.TimeInForceGTC
 	if u.OrderType == max.OrderTypeIOCLimit {
 		timeInForce = types.TimeInForceIOC
@@ -327,16 +290,16 @@ func convertWebSocketOrderUpdate(u max.OrderUpdate) (*types.Order, error) {
 			Symbol:        toGlobalSymbol(u.Market),
 			Side:          toGlobalSideType(u.Side),
 			Type:          toGlobalOrderType(u.OrderType),
-			Quantity:      fixedpoint.MustNewFromString(u.Volume),
-			Price:         fixedpoint.MustNewFromString(u.Price),
-			StopPrice:     fixedpoint.MustNewFromString(u.StopPrice),
+			Quantity:      u.Volume,
+			Price:         u.Price,
+			StopPrice:     u.StopPrice,
 			TimeInForce:   timeInForce, // MAX only supports GTC
 			GroupID:       u.GroupID,
 		},
 		Exchange:         types.ExchangeMax,
 		OrderID:          u.ID,
-		Status:           toGlobalOrderStatus(u.State, executedVolume, remainingVolume),
-		ExecutedQuantity: executedVolume,
+		Status:           toGlobalOrderStatus(u.State, u.ExecutedVolume, u.RemainingVolume),
+		ExecutedQuantity: u.ExecutedVolume,
 		CreationTime:     types.Time(time.Unix(0, u.CreatedAtMs*int64(time.Millisecond))),
 		UpdateTime:       types.Time(time.Unix(0, u.CreatedAtMs*int64(time.Millisecond))),
 	}, nil

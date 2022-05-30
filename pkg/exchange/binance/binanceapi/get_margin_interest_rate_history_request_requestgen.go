@@ -160,7 +160,7 @@ func (g *GetMarginInterestRateHistoryRequest) Do(ctx context.Context) ([]MarginI
 
 	apiURL := "/sapi/v1/margin/interestRateHistory"
 
-	req, err := g.client.NewAuthenticatedRequest(ctx, "GET", apiURL, query, params)
+	req, err := g.client.NewRequest(ctx, "GET", apiURL, query, params)
 	if err != nil {
 		return nil, err
 	}

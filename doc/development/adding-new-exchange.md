@@ -6,6 +6,9 @@ You should send multiple small pull request to implement them.
 
 **Please avoid sending a pull request with huge changes**
 
+**Important** -- for the underlying http API please use `requestgen` <https://github.com/c9s/requestgen> to generate the
+requests.
+
 ## Checklist
 
 Exchange Interface - the minimum requirement for spot trading
@@ -33,27 +36,27 @@ Back-testing service - kline data is used for back-testing
 Convert functions:
 
 - [ ] MarketData convert functions
-  - [ ] toGlobalMarket
-  - [ ] toGlobalTicker
-  - [ ] toGlobalKLine
+    - [ ] toGlobalMarket
+    - [ ] toGlobalTicker
+    - [ ] toGlobalKLine
 - [ ] UserData convert functions
-  - [ ] toGlobalOrder
-  - [ ] toGlobalTrade
-  - [ ] toGlobalAccount
-  - [ ] toGlobalBalance
+    - [ ] toGlobalOrder
+    - [ ] toGlobalTrade
+    - [ ] toGlobalAccount
+    - [ ] toGlobalBalance
 
 Stream
 
 - [ ] UserDataStream
-  - [ ] Trade message parser
-  - [ ] Order message parser
-  - [ ] Account message parser
-  - [ ] Balance message parser
+    - [ ] Trade message parser
+    - [ ] Order message parser
+    - [ ] Account message parser
+    - [ ] Balance message parser
 - [ ] MarketDataStream
-  - [ ] OrderBook message parser (or depth)
-  - [ ] KLine message parser (required for backtesting)
-  - [ ] Public trade message parser (optional)
-  - [ ] Ticker message parser (optional)
+    - [ ] OrderBook message parser (or depth)
+    - [ ] KLine message parser (required for backtesting)
+    - [ ] Public trade message parser (optional)
+    - [ ] Ticker message parser (optional)
 - [ ] ping/pong handling.
 - [ ] heart-beat hanlding or keep-alive handling.
 - [ ] handling reconnect
@@ -61,13 +64,19 @@ Stream
 Database
 
 - [ ] Add a new kline table for the exchange (this is required for back-testing)
-  - [ ] Add MySQL migration SQL
-  - [ ] Add SQLite migration SQL
+    - [ ] Add MySQL migration SQL
+    - [ ] Add SQLite migration SQL
 
 Exchange Factory
 
 - [ ] Add the exchange constructor to the exchange instance factory function.
 - [ ] Add extended fields to the ExchangeSession struct. (optional)
+
+# Tools
+
+- Use a tool to convert JSON response to Go struct <https://mholt.github.io/json-to-go/>
+- Use requestgen to generate request builders <https://github.com/c9s/requestgen>
+- Use callbackgen to generate callbacks <https://github.com/c9s/callbackgen>
 
 # Implementation
 
@@ -79,8 +88,8 @@ const (
 	ExchangeBinance  = ExchangeName("binance")
 	ExchangeFTX      = ExchangeName("ftx")
 	ExchangeOKEx     = ExchangeName("okex")
-    ExchangeKucoin   = ExchangeName("kucoin")
-    ExchangeBacktest = ExchangeName("backtest")
+        ExchangeKucoin   = ExchangeName("kucoin")
+        ExchangeBacktest = ExchangeName("backtest")
 )
 ```
 
@@ -104,6 +113,66 @@ func NewExchangeStandard(n types.ExchangeName, key, secret, passphrase, subAccou
 }
 ```
 
+## Using requestgen
+
+### Alias
+
+You can put the go:generate alias on the top of the file:
+
+```
+//go:generate -command GetRequest requestgen -method GET
+//go:generate -command PostRequest requestgen -method POST
+//go:generate -command DeleteRequest requestgen -method DELETE
+```
+
+Please note that the alias only works in the same file.
+
+### Defining Request Type Names
+
+Please define request type name in the following format:
+
+```
+{Verb}{Service}{Resource}Request
+```
+
+for example:
+
+```
+type GetMarginMarketsRequest struct {
+	client requestgen.APIClient
+}
+```
+
+then you can attach the go:generate command on that type:
+
+```
+
+//go:generate GetRequest -url "/api/v3/wallet/m/limits" -type GetMarginBorrowingLimitsRequest -responseType .MarginBorrowingLimitMap
+```
+
+## Un-marshalling Timestamps
+
+For millisecond timestamps, you can use `types.MillisecondTimestamp`, it will automatically convert the timestamp into
+time.Time:
+
+```
+type MarginInterestRecord struct {
+  Currency     string                     `json:"currency"`
+  CreatedAt    types.MillisecondTimestamp `json:"created_at"`
+}
+```
+
+## Un-marshalling numbers
+
+For number fields, especially floating numbers, please use `fixedpoint.Value`, it can parse int, float64, float64 in
+string:
+
+```
+type A struct {
+  Amount       fixedpoint.Value           `json:"amount"`
+}
+```
+
 ## Test Market Data Stream
 
 ### Test order book stream
@@ -117,7 +186,6 @@ godotenv -f .env.local -- go run ./cmd/bbgo orderbook --config config/bbgo.yaml 
 ```shell
 godotenv -f .env.local -- go run ./cmd/bbgo --config config/bbgo.yaml userdatastream --session kucoin
 ```
-
 
 ## Test Restful Endpoints
 

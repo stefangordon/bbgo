@@ -6,19 +6,18 @@ package max
 import (
 	"context"
 	"net/url"
-	"time"
 
 	"github.com/c9s/requestgen"
 	"github.com/pkg/errors"
 
+	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
-var relUrlV2Order *url.URL
-var relUrlV2Orders *url.URL
-var relUrlV2OrdersClear *url.URL
-var relUrlV2OrdersDelete *url.URL
-var relUrlV2OrdersMultiOneByOne, relUrlV2OrderDelete *url.URL
+var (
+	relUrlV2Orders              *url.URL
+	relUrlV2OrdersMultiOneByOne *url.URL
+)
 
 func mustParseURL(s string) *url.URL {
 	u, err := url.Parse(s)
@@ -29,13 +28,16 @@ func mustParseURL(s string) *url.URL {
 }
 
 func init() {
-	relUrlV2Order = mustParseURL("v2/order")
-	relUrlV2OrderDelete = mustParseURL("v2/order/delete")
 	relUrlV2Orders = mustParseURL("v2/orders")
-	relUrlV2OrdersClear = mustParseURL("v2/orders/clear")
-	relUrlV2OrdersDelete = mustParseURL("v2/orders/delete")
 	relUrlV2OrdersMultiOneByOne = mustParseURL("v2/orders/multi/onebyone")
 }
+
+type WalletType string
+
+const (
+	WalletTypeSpot   WalletType = "spot"
+	WalletTypeMargin WalletType = "m"
+)
 
 type OrderStateToQuery int
 
@@ -82,80 +84,35 @@ type OrderService struct {
 	client *RestClient
 }
 
+type SubmitOrder struct {
+	Side      string    `json:"side"`
+	Market    string    `json:"market"`
+	Price     string    `json:"price"`
+	StopPrice string    `json:"stop_price,omitempty"`
+	OrderType OrderType `json:"ord_type"`
+	Volume    string    `json:"volume"`
+	GroupID   uint32    `json:"group_id,omitempty"`
+	ClientOID string    `json:"client_oid,omitempty"`
+}
+
 // Order represents one returned order (POST order/GET order/GET orders) on the max platform.
 type Order struct {
 	ID              uint64                     `json:"id,omitempty"`
+	WalletType      WalletType                 `json:"wallet_type,omitempty"`
 	Side            string                     `json:"side"`
 	OrderType       OrderType                  `json:"ord_type"`
-	Price           string                     `json:"price,omitempty"`
-	StopPrice       string                     `json:"stop_price,omitempty"`
-	AveragePrice    string                     `json:"avg_price,omitempty"`
+	Price           fixedpoint.Value           `json:"price,omitempty"`
+	StopPrice       fixedpoint.Value           `json:"stop_price,omitempty"`
+	AveragePrice    fixedpoint.Value           `json:"avg_price,omitempty"`
 	State           OrderState                 `json:"state,omitempty"`
 	Market          string                     `json:"market,omitempty"`
-	Volume          string                     `json:"volume"`
-	RemainingVolume string                     `json:"remaining_volume,omitempty"`
-	ExecutedVolume  string                     `json:"executed_volume,omitempty"`
+	Volume          fixedpoint.Value           `json:"volume"`
+	RemainingVolume fixedpoint.Value           `json:"remaining_volume,omitempty"`
+	ExecutedVolume  fixedpoint.Value           `json:"executed_volume,omitempty"`
 	TradesCount     int64                      `json:"trades_count,omitempty"`
 	GroupID         uint32                     `json:"group_id,omitempty"`
 	ClientOID       string                     `json:"client_oid,omitempty"`
-	CreatedAt       time.Time                  `json:"-" db:"created_at"`
-	CreatedAtMs     types.MillisecondTimestamp `json:"created_at_in_ms,omitempty"`
-	InsertedAt      time.Time                  `json:"-" db:"inserted_at"`
-}
-
-// Open returns open orders
-func (s *OrderService) Closed(market string, options QueryOrderOptions) ([]Order, error) {
-	req := s.NewGetOrdersRequest()
-	req.Market(market)
-	req.State([]OrderState{OrderStateDone, OrderStateCancel})
-
-	if options.GroupID > 0 {
-		req.GroupID(uint32(options.GroupID))
-	}
-	if options.Offset > 0 {
-		req.Offset(options.Offset)
-	}
-	if options.Limit > 0 {
-		req.Limit(options.Limit)
-	}
-
-	if options.Page > 0 {
-		req.Page(options.Page)
-	}
-
-	if len(options.OrderBy) > 0 {
-		req.OrderBy(options.OrderBy)
-	}
-
-	return req.Do(context.Background())
-}
-
-// Open returns open orders
-func (s *OrderService) Open(market string, options QueryOrderOptions) ([]Order, error) {
-	req := s.NewGetOrdersRequest()
-	req.Market(market)
-	// state default ot wait and convert
-
-	if options.GroupID > 0 {
-		req.GroupID(uint32(options.GroupID))
-	}
-
-	return req.Do(context.Background())
-}
-
-//go:generate GetRequest -url "v2/orders/history" -type GetOrderHistoryRequest -responseType []Order
-type GetOrderHistoryRequest struct {
-	client requestgen.AuthenticatedAPIClient
-
-	market string `param:"market"`
-	fromID *uint64 `param:"from_id"`
-	limit  *uint   `param:"limit"`
-}
-
-func (s *OrderService) NewGetOrderHistoryRequest() *GetOrderHistoryRequest {
-	return &GetOrderHistoryRequest{
-		client: s.client,
-	}
+	CreatedAt       types.MillisecondTimestamp `json:"created_at"`
 }
 
 //go:generate GetRequest -url "v2/orders" -type GetOrdersRequest -responseType []Order
@@ -210,7 +167,7 @@ func (s *OrderService) All(market string, limit, page int, states ...OrderState)
 type Options map[string]interface{}
 
 // Create multiple order in a single request
-func (s *OrderService) CreateMulti(market string, orders []Order) (*MultiOrderResponse, error) {
+func (s *OrderService) CreateMulti(market string, orders []SubmitOrder) (*MultiOrderResponse, error) {
 	req := s.NewCreateMultiOrderRequest()
 	req.Market(market)
 	req.AddOrders(orders...)
@@ -271,7 +228,7 @@ type CreateMultiOrderRequest struct {
 
 	market  *string
 	groupID *uint32
-	orders  []Order
+	orders  []SubmitOrder
 }
 
 func (r *CreateMultiOrderRequest) GroupID(groupID uint32) *CreateMultiOrderRequest {
@@ -284,7 +241,7 @@ func (r *CreateMultiOrderRequest) Market(market string) *CreateMultiOrderRequest
 	return r
 }
 
-func (r *CreateMultiOrderRequest) AddOrders(orders ...Order) *CreateMultiOrderRequest {
+func (r *CreateMultiOrderRequest) AddOrders(orders ...SubmitOrder) *CreateMultiOrderRequest {
 	r.orders = append(r.orders, orders...)
 	return r
 }

@@ -1,0 +1,31 @@
+sessions:
+  binance:
+    exchange: binance
+    envVarPrefix: binance
+#    futures: true
+
+
+exchangeStrategies:
+- on: binance
+  pivotshort:
+    symbol: BTCBUSD
+    interval: 5m
+    quantity: 1.0
+    pivotLength: 60
+    stopLossRatio: 0.8%
+    catBounceRatio: 3%
+    numLayers: 5
+    shadowTPRatio: 2%
+
+backtest:
+  sessions:
+    - binance
+  startTime: "2022-01-01"
+  endTime: "2022-05-10"
+  symbols:
+    - BTCBUSD
+  account:
+    binance:
+      balances:
+        BTC: 1.0
+        BUSD: 40_000.0
