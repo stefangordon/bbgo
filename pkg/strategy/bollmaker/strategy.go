@@ -49,81 +49,6 @@ type BollingerSetting struct {
 	BandWidth float64 `json:"bandWidth"`
 }
 
-type DynamicSpreadSettings struct {
-	Enabled bool `json:"enabled"`
-
-	// Window is the window of the SMAs of spreads
-	Window int `json:"window"`
-
-	// AskSpreadScale is used to define the ask spread range with the given percentage.
-	AskSpreadScale *bbgo.PercentageScale `json:"askSpreadScale"`
-
-	// BidSpreadScale is used to define the bid spread range with the given percentage.
-	BidSpreadScale *bbgo.PercentageScale `json:"bidSpreadScale"`
-
-	DynamicAskSpread *indicator.SMA
-	DynamicBidSpread *indicator.SMA
-}
-
-// Update dynamic spreads
-func (ds *DynamicSpreadSettings) Update(kline types.KLine) {
-	if !ds.Enabled {
-		return
-	}
-
-	ampl := (kline.GetHigh().Float64() - kline.GetLow().Float64()) / kline.GetOpen().Float64()
-
-	switch kline.Direction() {
-	case types.DirectionUp:
-		ds.DynamicAskSpread.Update(ampl)
-		ds.DynamicBidSpread.Update(0)
-	case types.DirectionDown:
-		ds.DynamicBidSpread.Update(ampl)
-		ds.DynamicAskSpread.Update(0)
-	default:
-		ds.DynamicAskSpread.Update(0)
-		ds.DynamicBidSpread.Update(0)
-	}
-}
-
-// GetAskSpread returns current ask spread
-func (ds *DynamicSpreadSettings) GetAskSpread() (askSpread float64, err error) {
-	if !ds.Enabled {
-		return 0, errors.New("dynamic spread is not enabled")
-	}
-
-	if ds.AskSpreadScale != nil && ds.DynamicAskSpread.Length() >= ds.Window {
-		askSpread, err = ds.AskSpreadScale.Scale(ds.DynamicAskSpread.Last())
-		if err != nil {
-			log.WithError(err).Errorf("can not calculate dynamicAskSpread")
-			return 0, err
-		}
-
-		return askSpread, nil
-	}
-
-	return 0, errors.New("incomplete dynamic spread settings or not enough data yet")
-}
-
-// GetBidSpread returns current dynamic bid spread
-func (ds *DynamicSpreadSettings) GetBidSpread() (bidSpread float64, err error) {
-	if !ds.Enabled {
-		return 0, errors.New("dynamic spread is not enabled")
-	}
-
-	if ds.BidSpreadScale != nil && ds.DynamicBidSpread.Length() >= ds.Window {
-		bidSpread, err = ds.BidSpreadScale.Scale(ds.DynamicBidSpread.Last())
-		if err != nil {
-			log.WithError(err).Errorf("can not calculate dynamicBidSpread")
-			return 0, err
-		}
-
-		return bidSpread, nil
-	}
-
-	return 0, errors.New("incomplete dynamic spread settings or not enough data yet")
-}
-
 type Strategy struct {
 	*bbgo.Graceful
 	*bbgo.Notifiability
@@ -408,18 +333,22 @@ func (s *Strategy) placeOrders(ctx context.Context, orderExecutor bbgo.OrderExec
 	downBand := s.defaultBoll.LastDownBand()
 	upBand := s.defaultBoll.LastUpBand()
 	sma := s.defaultBoll.LastSMA()
-	log.Infof("bollinger band: up %f sma %f down %f", upBand, sma, downBand)
+	log.Infof("%s bollinger band: up %f sma %f down %f", s.Symbol, upBand, sma, downBand)
 
 	bandPercentage := calculateBandPercentage(upBand, downBand, sma, midPrice.Float64())
-	log.Infof("mid price band percentage: %v", bandPercentage)
+	log.Infof("%s mid price band percentage: %v", s.Symbol, bandPercentage)
 
 	maxExposurePosition, err := s.getCurrentAllowedExposurePosition(bandPercentage)
 	if err != nil {
-		log.WithError(err).Errorf("can not calculate CurrentAllowedExposurePosition")
+		log.WithError(err).Errorf("can not calculate %s CurrentAllowedExposurePosition", s.Symbol)
 		return
 	}
 
-	log.Infof("calculated max exposure position: %v", maxExposurePosition)
+	log.Infof("calculated %s max exposure position: %v", s.Symbol, maxExposurePosition)
+
+	if !s.Position.IsClosed() && !s.Position.IsDust(midPrice) {
+		log.Infof("current %s unrealized profit: %f %s", s.Symbol, s.Position.UnrealizedProfit(midPrice).Float64(), s.Market.QuoteCurrency)
+	}
 
 	canSell := true
 	canBuy := true
@@ -429,7 +358,7 @@ func (s *Strategy) placeOrders(ctx context.Context, orderExecutor bbgo.OrderExec
 	}
 
 	if maxExposurePosition.Sign() > 0 {
-		if s.Long != nil && *s.Long && base.Sign() < 0 {
+		if s.hasLongSet() && base.Sign() < 0 {
 			canSell = false
 		} else if base.Compare(maxExposurePosition.Neg()) < 0 {
 			canSell = false
@@ -478,7 +407,7 @@ func (s *Strategy) placeOrders(ctx context.Context, orderExecutor bbgo.OrderExec
 		}
 	}
 
-	trend := s.detectPriceTrend(s.neutralBoll, midPrice.Float64())
+	trend := detectPriceTrend(s.neutralBoll, midPrice.Float64())
 	switch trend {
 	case NeutralTrend:
 		// do nothing
@@ -502,11 +431,26 @@ func (s *Strategy) placeOrders(ctx context.Context, orderExecutor bbgo.OrderExec
 		canSell = false
 	}
 
-	if midPrice.Compare(s.Position.AverageCost.Mul(fixedpoint.One.Add(s.MinProfitSpread))) < 0 {
-		canSell = false
+	isLongPosition := s.Position.IsLong()
+	isShortPosition := s.Position.IsShort()
+	minProfitPrice := s.Position.AverageCost.Mul(fixedpoint.One.Add(s.MinProfitSpread))
+	if isShortPosition {
+		minProfitPrice = s.Position.AverageCost.Mul(fixedpoint.One.Sub(s.MinProfitSpread))
 	}
 
-	if s.Long != nil && *s.Long && base.Sub(sellOrder.Quantity).Sign() < 0 {
+	if isLongPosition {
+		// for long position if the current price is lower than the minimal profitable price then we should stop sell
+		if midPrice.Compare(minProfitPrice) < 0 {
+			canSell = false
+		}
+	} else if isShortPosition {
+		// for short position if the current price is higher than the minimal profitable price then we should stop buy
+		if midPrice.Compare(minProfitPrice) > 0 {
+			canBuy = false
+		}
+	}
+
+	if s.hasLongSet() && base.Sub(sellOrder.Quantity).Sign() < 0 {
 		canSell = false
 	}
 
@@ -533,7 +477,7 @@ func (s *Strategy) placeOrders(ctx context.Context, orderExecutor bbgo.OrderExec
 	}
 
 	for i := range submitOrders {
-		submitOrders[i] = s.adjustOrderQuantity(submitOrders[i])
+		submitOrders[i] = adjustOrderQuantity(submitOrders[i], s.Market)
 	}
 
 	createdOrders, err := orderExecutor.SubmitOrders(ctx, submitOrders...)
@@ -544,41 +488,12 @@ func (s *Strategy) placeOrders(ctx context.Context, orderExecutor bbgo.OrderExec
 	s.activeMakerOrders.Add(createdOrders...)
 }
 
-type PriceTrend string
-
-const (
-	NeutralTrend PriceTrend = "neutral"
-	UpTrend      PriceTrend = "upTrend"
-	DownTrend    PriceTrend = "downTrend"
-	UnknownTrend PriceTrend = "unknown"
-)
-
-func (s *Strategy) detectPriceTrend(inc *indicator.BOLL, price float64) PriceTrend {
-	if inBetween(price, inc.LastDownBand(), inc.LastUpBand()) {
-		return NeutralTrend
-	}
-
-	if price < inc.LastDownBand() {
-		return DownTrend
-	}
-
-	if price > inc.LastUpBand() {
-		return UpTrend
-	}
-
-	return UnknownTrend
+func (s *Strategy) hasLongSet() bool {
+	return s.Long != nil && *s.Long
 }
 
-func (s *Strategy) adjustOrderQuantity(submitOrder types.SubmitOrder) types.SubmitOrder {
-	if submitOrder.Quantity.Mul(submitOrder.Price).Compare(s.Market.MinNotional) < 0 {
-		submitOrder.Quantity = bbgo.AdjustFloatQuantityByMinAmount(submitOrder.Quantity, submitOrder.Price, s.Market.MinNotional.Mul(notionModifier))
-	}
-
-	if submitOrder.Quantity.Compare(s.Market.MinQuantity) < 0 {
-		submitOrder.Quantity = fixedpoint.Max(submitOrder.Quantity, s.Market.MinQuantity)
-	}
-
-	return submitOrder
+func (s *Strategy) hasShortSet() bool {
+	return s.Short != nil && *s.Short
 }
 
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
@@ -643,15 +558,15 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	instanceID := s.InstanceID()
 	s.groupID = util.FNV32(instanceID)
 
-	// restore state
-	if err := s.LoadState(); err != nil {
-		return err
-	}
-
 	// If position is nil, we need to allocate a new position for calculation
 	if s.Position == nil {
+		// restore state (legacy)
+		if err := s.LoadState(); err != nil {
+			return err
+		}
+
 		// fallback to the legacy position struct in the state
-		if s.state != nil && s.state.Position != nil {
+		if s.state != nil && s.state.Position != nil && !s.state.Position.Base.IsZero() {
 			s.Position = s.state.Position
 		} else {
 			s.Position = types.NewPositionFromMarket(s.Market)
@@ -708,7 +623,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s.Notify(&p)
 
 			s.ProfitStats.AddProfit(p)
-			s.Notify(&s.ProfitStats)
+			s.Notify(s.ProfitStats)
 
 			s.Environment.RecordPosition(s.Position, trade, &p)
 		}
@@ -717,6 +632,10 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	s.tradeCollector.OnPositionUpdate(func(position *types.Position) {
 		log.Infof("position changed: %s", s.Position)
 		s.Notify(s.Position)
+
+		if err := s.Persistence.Sync(s); err != nil {
+			log.WithError(err).Errorf("can not sync state to persistence")
+		}
 	})
 
 	s.tradeCollector.BindStream(session.UserDataStream)
@@ -821,4 +740,16 @@ func calculateBandPercentage(up, down, sma, midPrice float64) float64 {
 
 func inBetween(x, a, b float64) bool {
 	return a < x && x < b
+}
+
+func adjustOrderQuantity(submitOrder types.SubmitOrder, market types.Market) types.SubmitOrder {
+	if submitOrder.Quantity.Mul(submitOrder.Price).Compare(market.MinNotional) < 0 {
+		submitOrder.Quantity = bbgo.AdjustFloatQuantityByMinAmount(submitOrder.Quantity, submitOrder.Price, market.MinNotional.Mul(notionModifier))
+	}
+
+	if submitOrder.Quantity.Compare(market.MinQuantity) < 0 {
+		submitOrder.Quantity = fixedpoint.Max(submitOrder.Quantity, market.MinQuantity)
+	}
+
+	return submitOrder
 }

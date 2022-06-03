@@ -245,7 +245,7 @@ func (e *Exchange) queryClosedOrdersByLastOrderID(ctx context.Context, symbol st
 		orders = append(orders, *order)
 	}
 
-	orders = types.SortOrderAscending(orders)
+	orders = types.SortOrdersAscending(orders)
 	return orders, nil
 }
 
@@ -407,7 +407,7 @@ func toMaxSubmitOrder(o types.SubmitOrder) (*maxapi.SubmitOrder, error) {
 	return &maxOrder, nil
 }
 
-func (e *Exchange) Withdrawal(ctx context.Context, asset string, amount fixedpoint.Value, address string, options *types.WithdrawalOptions) error {
+func (e *Exchange) Withdraw(ctx context.Context, asset string, amount fixedpoint.Value, address string, options *types.WithdrawalOptions) error {
 	asset = toLocalCurrency(asset)
 
 	addresses, err := e.client.WithdrawalService.NewGetWithdrawalAddressesRequest().
@@ -449,73 +449,66 @@ func (e *Exchange) Withdrawal(ctx context.Context, asset string, amount fixedpoi
 }
 
 func (e *Exchange) SubmitOrders(ctx context.Context, orders ...types.SubmitOrder) (createdOrders types.OrderSlice, err error) {
-	if len(orders) > 1 && len(orders) < 15 {
-		var ordersBySymbol = map[string][]maxapi.SubmitOrder{}
-		for _, o := range orders {
-			maxOrder, err := toMaxSubmitOrder(o)
-			if err != nil {
-				return nil, err
-			}
-
-			ordersBySymbol[maxOrder.Market] = append(ordersBySymbol[maxOrder.Market], *maxOrder)
-		}
-
-		for symbol, orders := range ordersBySymbol {
-			req := e.client.OrderService.NewCreateMultiOrderRequest()
-			req.Market(symbol)
-			req.AddOrders(orders...)
-
-			orderResponses, err := req.Do(ctx)
-			if err != nil {
-				return createdOrders, err
-			}
-
-			for _, resp := range *orderResponses {
-				if len(resp.Error) > 0 {
-					log.Errorf("multi-order submit error: %s", resp.Error)
-					continue
-				}
-
-				o, err := toGlobalOrder(resp.Order)
-				if err != nil {
-					return createdOrders, err
-				}
-
-				createdOrders = append(createdOrders, *o)
-			}
-		}
-
-		return createdOrders, nil
+	walletType := maxapi.WalletTypeSpot
+	if e.MarginSettings.IsMargin {
+		walletType = maxapi.WalletTypeMargin
 	}
 
-	for _, order := range orders {
-		maxOrder, err := toMaxSubmitOrder(order)
+	for _, o := range orders {
+		orderType, err := toLocalOrderType(o.Type)
 		if err != nil {
 			return createdOrders, err
 		}
 
-		req := e.client.OrderService.NewCreateOrderRequest().
-			Market(maxOrder.Market).
-			Side(maxOrder.Side).
-			Volume(maxOrder.Volume).
-			OrderType(string(maxOrder.OrderType))
-
-		if len(maxOrder.ClientOID) > 0 {
-			req.ClientOrderID(maxOrder.ClientOID)
+		// case IOC type
+		if orderType == maxapi.OrderTypeLimit && o.TimeInForce == types.TimeInForceIOC {
+			orderType = maxapi.OrderTypeIOCLimit
 		}
 
-		if len(maxOrder.Price) > 0 {
-			req.Price(maxOrder.Price)
+		var quantityString string
+		if o.Market.Symbol != "" {
+			quantityString = o.Market.FormatQuantity(o.Quantity)
+		} else {
+			quantityString = o.Quantity.String()
 		}
 
-		if len(maxOrder.StopPrice) > 0 {
-			req.StopPrice(maxOrder.StopPrice)
+		clientOrderID := NewClientOrderID(o.ClientOrderID)
+
+		req := e.v3order.NewCreateWalletOrderRequest(walletType)
+		req.Market(toLocalSymbol(o.Symbol)).
+			Side(toLocalSideType(o.Side)).
+			Volume(quantityString).
+			OrderType(string(orderType)).
+			ClientOrderID(clientOrderID)
+
+		switch o.Type {
+		case types.OrderTypeStopLimit, types.OrderTypeLimit, types.OrderTypeLimitMaker:
+			var priceInString string
+			if o.Market.Symbol != "" {
+				priceInString = o.Market.FormatPrice(o.Price)
+			} else {
+				priceInString = o.Price.String()
+			}
+			req.Price(priceInString)
+		}
+
+		// set stop price field for limit orders
+		switch o.Type {
+		case types.OrderTypeStopLimit, types.OrderTypeStopMarket:
+			var priceInString string
+			if o.Market.Symbol != "" {
+				priceInString = o.Market.FormatPrice(o.StopPrice)
+			} else {
+				priceInString = o.StopPrice.String()
+			}
+			req.StopPrice(priceInString)
 		}
 
 		retOrder, err := req.Do(ctx)
 		if err != nil {
 			return createdOrders, err
 		}
+
 		if retOrder == nil {
 			return createdOrders, errors.New("returned nil order")
 		}
@@ -551,22 +544,6 @@ func (e *Exchange) QueryAccount(ctx context.Context) (*types.Account, error) {
 		return nil, err
 	}
 
-	userInfo, err := e.client.AccountService.NewGetMeRequest().Do(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var balances = make(types.BalanceMap)
-	for _, a := range userInfo.Accounts {
-		cur := toGlobalCurrency(a.Currency)
-		balances[toGlobalCurrency(a.Currency)] = types.Balance{
-			Currency:  cur,
-			Available: a.Balance,
-			Locked:    a.Locked,
-			NetAsset:  a.Balance.Add(a.Locked),
-		}
-	}
-
 	vipLevel, err := e.client.AccountService.NewGetVipLevelRequest().Do(ctx)
 	if err != nil {
 		return nil, err
@@ -583,6 +560,12 @@ func (e *Exchange) QueryAccount(ctx context.Context) (*types.Account, error) {
 		TakerFeeRate: fixedpoint.NewFromFloat(vipLevel.Current.TakerFee), // 0.15% = 0.0015
 	}
 
+	balances, err := e.QueryAccountBalances(ctx)
+	if err != nil {
+		return nil, err
+	}
+	a.UpdateBalances(balances)
+
 	if e.MarginSettings.IsMargin {
 		a.AccountType = types.AccountTypeMargin
 
@@ -596,8 +579,39 @@ func (e *Exchange) QueryAccount(ctx context.Context) (*types.Account, error) {
 		a.TotalAccountValue = adRatio.AssetInUsdt
 	}
 
-	a.UpdateBalances(balances)
 	return a, nil
+}
+
+func (e *Exchange) QueryAccountBalances(ctx context.Context) (types.BalanceMap, error) {
+	if err := accountQueryLimiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	walletType := maxapi.WalletTypeSpot
+	if e.MarginSettings.IsMargin {
+		walletType = maxapi.WalletTypeMargin
+	}
+
+	req := e.v3order.NewGetWalletAccountsRequest(walletType)
+	accounts, err := req.Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var balances = make(types.BalanceMap)
+	for _, b := range accounts {
+		cur := toGlobalCurrency(b.Currency)
+		balances[cur] = types.Balance{
+			Currency:  cur,
+			Available: b.Balance,
+			Locked:    b.Locked,
+			NetAsset:  b.Balance.Add(b.Locked).Sub(b.Debt),
+			Borrowed:  b.Debt, // TODO: Replace this with borrow in the newer version
+			Interest:  b.Interest,
+		}
+	}
+
+	return balances, nil
 }
 
 func (e *Exchange) QueryWithdrawHistory(ctx context.Context, asset string, since, until time.Time) (allWithdraws []types.Withdraw, err error) {
@@ -761,31 +775,6 @@ func (e *Exchange) QueryDepositHistory(ctx context.Context, asset string, since,
 	return allDeposits, err
 }
 
-func (e *Exchange) QueryAccountBalances(ctx context.Context) (types.BalanceMap, error) {
-	if err := accountQueryLimiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	accounts, err := e.client.AccountService.NewGetAccountsRequest().Do(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var balances = make(types.BalanceMap)
-
-	for _, a := range accounts {
-		cur := toGlobalCurrency(a.Currency)
-		balances[cur] = types.Balance{
-			Currency:  cur,
-			Available: a.Balance,
-			Locked:    a.Locked,
-			NetAsset:  a.Balance.Add(a.Locked),
-		}
-	}
-
-	return balances, nil
-}
-
 func (e *Exchange) QueryTrades(ctx context.Context, symbol string, options *types.TradeQueryOptions) (trades []types.Trade, err error) {
 	if err := tradeQueryLimiter.Wait(ctx); err != nil {
 		return nil, err
@@ -936,4 +925,55 @@ func (e *Exchange) QueryAveragePrice(ctx context.Context, symbol string) (fixedp
 
 	return fixedpoint.MustNewFromString(ticker.Sell).
 		Add(fixedpoint.MustNewFromString(ticker.Buy)).Div(Two), nil
+}
+
+func (e *Exchange) RepayMarginAsset(ctx context.Context, asset string, amount fixedpoint.Value) error {
+	req := e.v3margin.NewMarginRepayRequest()
+	req.Currency(toLocalCurrency(asset))
+	req.Amount(amount.String())
+	resp, err := req.Do(ctx)
+	if err != nil {
+		return err
+	}
+
+	log.Infof("margin repay: %v", resp)
+	return nil
+}
+
+func (e *Exchange) BorrowMarginAsset(ctx context.Context, asset string, amount fixedpoint.Value) error {
+	req := e.v3margin.NewMarginLoanRequest()
+	req.Currency(toLocalCurrency(asset))
+	req.Amount(amount.String())
+	resp, err := req.Do(ctx)
+	if err != nil {
+		return err
+	}
+
+	log.Infof("margin borrow: %v", resp)
+	return nil
+}
+
+func (e *Exchange) QueryMarginAssetMaxBorrowable(ctx context.Context, asset string) (amount fixedpoint.Value, err error) {
+	req := e.v3margin.NewGetMarginBorrowingLimitsRequest()
+	resp, err := req.Do(ctx)
+	if err != nil {
+		return fixedpoint.Zero, err
+	}
+
+	limits := *resp
+	if limit, ok := limits[toLocalCurrency(asset)]; ok {
+		return limit, nil
+	}
+
+	err = fmt.Errorf("borrowing limit of %s not found", asset)
+	return amount, err
+}
+
+// DefaultFeeRates returns the MAX VIP 0 fee schedule
+// See also https://max-vip-zh.maicoin.com/
+func (e *Exchange) DefaultFeeRates() types.ExchangeFee {
+	return types.ExchangeFee{
+		MakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.045), // 0.045%
+		TakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.150), // 0.15%
+	}
 }

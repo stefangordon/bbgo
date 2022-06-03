@@ -295,15 +295,16 @@ func (session *ExchangeSession) GetAccount() (a *types.Account) {
 }
 
 // UpdateAccount locks the account mutex and update the account object
-func (session *ExchangeSession) UpdateAccount(ctx context.Context) error {
+func (session *ExchangeSession) UpdateAccount(ctx context.Context) (*types.Account, error) {
 	account, err := session.Exchange.QueryAccount(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
 	session.accountMutex.Lock()
 	session.Account = account
 	session.accountMutex.Unlock()
-	return nil
+	return account, nil
 }
 
 // Init initializes the basic data structure and market information by its exchange.
@@ -334,6 +335,16 @@ func (session *ExchangeSession) Init(ctx context.Context, environ *Environment) 
 	}
 
 	session.markets = markets
+
+	if feeRateProvider, ok := session.Exchange.(types.ExchangeDefaultFeeRates); ok {
+		defaultFeeRates := feeRateProvider.DefaultFeeRates()
+		if session.MakerFeeRate.IsZero() {
+			session.MakerFeeRate = defaultFeeRates.MakerFeeRate
+		}
+		if session.TakerFeeRate.IsZero() {
+			session.TakerFeeRate = defaultFeeRates.TakerFeeRate
+		}
+	}
 
 	// query and initialize the balances
 	if !session.PublicOnly {
@@ -447,6 +458,8 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 			trades, err = environ.TradeService.Query(service.QueryTradesOptions{
 				Exchange: session.Exchange.Name(),
 				Symbol:   symbol,
+				Ordering: "DESC",
+				Limit:    100,
 			})
 		}
 
@@ -454,6 +467,7 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 			return err
 		}
 
+		trades = types.SortTradesAscending(trades)
 		log.Infof("symbol %s: %d trades loaded", symbol, len(trades))
 	}
 

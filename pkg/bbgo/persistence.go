@@ -86,67 +86,16 @@ func (p *Persistence) Sync(obj interface{}) error {
 	return storePersistenceFields(obj, id, ps)
 }
 
-type StructFieldIterator func(tag string, ft reflect.StructField, fv reflect.Value) error
-
-func iterateFieldsByTag(obj interface{}, tagName string, cb StructFieldIterator) error {
-	sv := reflect.ValueOf(obj)
-	st := reflect.TypeOf(obj)
-
-	if st.Kind() != reflect.Ptr {
-		return fmt.Errorf("f needs to be a pointer of a struct, %s given", st)
-	}
-
-	// solve the reference
-	st = st.Elem()
-	sv = sv.Elem()
-
-	if st.Kind() != reflect.Struct {
-		return fmt.Errorf("f needs to be a struct, %s given", st)
-	}
-
-	for i := 0; i < sv.NumField(); i++ {
-		fv := sv.Field(i)
-		ft := st.Field(i)
-
-		fvt := fv.Type()
-		_ = fvt
-
-		// skip unexported fields
-		if !st.Field(i).IsExported() {
-			continue
-		}
-
-		tag, ok := ft.Tag.Lookup(tagName)
-		if !ok {
-			continue
-		}
-
-		if err := cb(tag, ft, fv); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// https://github.com/xiaojun207/go-base-utils/blob/master/utils/Clone.go
-func newTypeValueInterface(typ reflect.Type) interface{} {
-	if typ.Kind() == reflect.Ptr {
-		typ = typ.Elem()
-		dst := reflect.New(typ).Elem()
-		return dst.Addr().Interface()
-	}
-	dst := reflect.New(typ)
-	return dst.Interface()
-}
-
 func loadPersistenceFields(obj interface{}, id string, persistence service.PersistenceService) error {
 	return iterateFieldsByTag(obj, "persistence", func(tag string, field reflect.StructField, value reflect.Value) error {
+		log.Debugf("[loadPersistenceFields] loading value into field %v, tag = %s, original value = %v", field, tag, value)
+
 		newValueInf := newTypeValueInterface(value.Type())
 		// inf := value.Interface()
 		store := persistence.NewStore("state", id, tag)
 		if err := store.Load(&newValueInf); err != nil {
 			if err == service.ErrPersistenceNotExists {
+				log.Debugf("[loadPersistenceFields] state key does not exist, id = %v, tag = %s", id, tag)
 				return nil
 			}
 
@@ -158,7 +107,7 @@ func loadPersistenceFields(obj interface{}, id string, persistence service.Persi
 			newValue = newValue.Elem()
 		}
 
-		// log.Debugf("%v = %v (%s) -> %v (%s)\n", field, value, value.Type(), newValue, newValue.Type())
+		log.Debugf("[loadPersistenceFields] %v = %v (%s) -> %v (%s)\n", field, value, value.Type(), newValue, newValue.Type())
 
 		value.Set(newValue)
 		return nil
@@ -167,8 +116,9 @@ func loadPersistenceFields(obj interface{}, id string, persistence service.Persi
 
 func storePersistenceFields(obj interface{}, id string, persistence service.PersistenceService) error {
 	return iterateFieldsByTag(obj, "persistence", func(tag string, ft reflect.StructField, fv reflect.Value) error {
-		inf := fv.Interface()
+		log.Debugf("[storePersistenceFields] storing value from field %v, tag = %s, original value = %v", ft, tag, fv)
 
+		inf := fv.Interface()
 		store := persistence.NewStore("state", id, tag)
 		return store.Save(inf)
 	})

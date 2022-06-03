@@ -61,7 +61,7 @@ type Strategy struct {
 
 	ExchangeSession *bbgo.ExchangeSession
 
-	marginBorrowRepay types.MarginBorrowRepay
+	marginBorrowRepay types.MarginBorrowRepayService
 }
 
 func (s *Strategy) ID() string {
@@ -75,12 +75,12 @@ func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 func (s *Strategy) tryToRepayAnyDebt(ctx context.Context) {
 	log.Infof("trying to repay any debt...")
 
-	if err := s.ExchangeSession.UpdateAccount(ctx); err != nil {
+	account, err := s.ExchangeSession.UpdateAccount(ctx)
+	if err != nil {
 		log.WithError(err).Errorf("can not update account")
 		return
 	}
 
-	account := s.ExchangeSession.GetAccount()
 	minMarginLevel := s.MinMarginLevel
 	curMarginLevel := account.MarginLevel
 
@@ -96,6 +96,7 @@ func (s *Strategy) tryToRepayAnyDebt(ctx context.Context) {
 
 		toRepay := b.Available
 		s.Notifiability.Notify(&MarginAction{
+			Exchange:       s.ExchangeSession.ExchangeName,
 			Action:         "Repay",
 			Asset:          b.Currency,
 			Amount:         toRepay,
@@ -115,13 +116,13 @@ func (s *Strategy) checkAndBorrow(ctx context.Context) {
 		return
 	}
 
-	if err := s.ExchangeSession.UpdateAccount(ctx); err != nil {
+	account, err := s.ExchangeSession.UpdateAccount(ctx)
+	if err != nil {
 		log.WithError(err).Errorf("can not update account")
 		return
 	}
 
 	minMarginLevel := s.MinMarginLevel
-	account := s.ExchangeSession.GetAccount()
 	curMarginLevel := account.MarginLevel
 
 	log.Infof("current account margin level: %s margin ratio: %s, margin tolerance: %s",
@@ -133,17 +134,25 @@ func (s *Strategy) checkAndBorrow(ctx context.Context) {
 	// if margin ratio is too low, do not borrow
 	if curMarginLevel.Compare(minMarginLevel) < 0 {
 		log.Infof("current margin level %f < min margin level %f, skip autoborrow", curMarginLevel.Float64(), minMarginLevel.Float64())
+		s.Notifiability.Notify("Warning!!! %s Current Margin Level %f < Minimal Margin Level %f",
+			s.ExchangeSession.Name,
+			curMarginLevel.Float64(),
+			minMarginLevel.Float64(),
+			account.Balances().Debts(),
+		)
 		s.tryToRepayAnyDebt(ctx)
 		return
 	}
 
-	balances := s.ExchangeSession.GetAccount().Balances()
+	balances := account.Balances()
 	if len(balances) == 0 {
 		log.Warn("balance is empty, skip autoborrow")
 		return
 	}
 
 	for _, marginAsset := range s.Assets {
+		changed := false
+
 		if marginAsset.Low.IsZero() {
 			log.Warnf("margin asset low balance is not set: %+v", marginAsset)
 			continue
@@ -176,7 +185,12 @@ func (s *Strategy) checkAndBorrow(ctx context.Context) {
 				}
 			}
 
+			if toBorrow.IsZero() {
+				continue
+			}
+
 			s.Notifiability.Notify(&MarginAction{
+				Exchange:       s.ExchangeSession.ExchangeName,
 				Action:         "Borrow",
 				Asset:          marginAsset.Asset,
 				Amount:         toBorrow,
@@ -184,7 +198,11 @@ func (s *Strategy) checkAndBorrow(ctx context.Context) {
 				MinMarginLevel: minMarginLevel,
 			})
 			log.Infof("sending borrow request %f %s", toBorrow.Float64(), marginAsset.Asset)
-			s.marginBorrowRepay.BorrowMarginAsset(ctx, marginAsset.Asset, toBorrow)
+			if err := s.marginBorrowRepay.BorrowMarginAsset(ctx, marginAsset.Asset, toBorrow); err != nil {
+				log.WithError(err).Errorf("borrow error")
+				continue
+			}
+			changed = true
 		} else {
 			// available balance is less than marginAsset.Low, we should trigger borrow
 			toBorrow := marginAsset.Low
@@ -193,7 +211,12 @@ func (s *Strategy) checkAndBorrow(ctx context.Context) {
 				toBorrow = fixedpoint.Min(toBorrow, marginAsset.MaxQuantityPerBorrow)
 			}
 
+			if toBorrow.IsZero() {
+				continue
+			}
+
 			s.Notifiability.Notify(&MarginAction{
+				Exchange:       s.ExchangeSession.ExchangeName,
 				Action:         "Borrow",
 				Asset:          marginAsset.Asset,
 				Amount:         toBorrow,
@@ -202,7 +225,21 @@ func (s *Strategy) checkAndBorrow(ctx context.Context) {
 			})
 
 			log.Infof("sending borrow request %f %s", toBorrow.Float64(), marginAsset.Asset)
-			s.marginBorrowRepay.BorrowMarginAsset(ctx, marginAsset.Asset, toBorrow)
+			if err := s.marginBorrowRepay.BorrowMarginAsset(ctx, marginAsset.Asset, toBorrow); err != nil {
+				log.WithError(err).Errorf("borrow error")
+				continue
+			}
+
+			changed = true
+		}
+
+		// if debt is changed, we need to update account
+		if changed {
+			account, err = s.ExchangeSession.UpdateAccount(ctx)
+			if err != nil {
+				log.WithError(err).Errorf("can not update account")
+				return
+			}
 		}
 	}
 }
@@ -267,6 +304,7 @@ func (s *Strategy) handleBinanceBalanceUpdateEvent(event *binance.BalanceUpdateE
 
 		toRepay := b.Available
 		s.Notifiability.Notify(&MarginAction{
+			Exchange:       s.ExchangeSession.ExchangeName,
 			Action:         "Repay",
 			Asset:          b.Currency,
 			Amount:         toRepay,
@@ -280,11 +318,12 @@ func (s *Strategy) handleBinanceBalanceUpdateEvent(event *binance.BalanceUpdateE
 }
 
 type MarginAction struct {
-	Action         string
-	Asset          string
-	Amount         fixedpoint.Value
-	MarginLevel    fixedpoint.Value
-	MinMarginLevel fixedpoint.Value
+	Exchange       types.ExchangeName `json:"exchange"`
+	Action         string             `json:"action"`
+	Asset          string             `json:"asset"`
+	Amount         fixedpoint.Value   `json:"amount"`
+	MarginLevel    fixedpoint.Value   `json:"marginLevel"`
+	MinMarginLevel fixedpoint.Value   `json:"minMarginLevel"`
 }
 
 func (a *MarginAction) SlackAttachment() slack.Attachment {
@@ -292,6 +331,11 @@ func (a *MarginAction) SlackAttachment() slack.Attachment {
 		Title: fmt.Sprintf("%s %s %s", a.Action, a.Amount, a.Asset),
 		Color: "warning",
 		Fields: []slack.AttachmentField{
+			{
+				Title: "Exchange",
+				Value: a.Exchange.String(),
+				Short: true,
+			},
 			{
 				Title: "Action",
 				Value: a.Action,
@@ -329,9 +373,9 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	s.ExchangeSession = session
 
-	marginBorrowRepay, ok := session.Exchange.(types.MarginBorrowRepay)
+	marginBorrowRepay, ok := session.Exchange.(types.MarginBorrowRepayService)
 	if !ok {
-		return fmt.Errorf("exchange %s does not implement types.MarginBorrowRepay", session.ExchangeName)
+		return fmt.Errorf("exchange %s does not implement types.MarginBorrowRepayService", session.ExchangeName)
 	}
 
 	s.marginBorrowRepay = marginBorrowRepay
