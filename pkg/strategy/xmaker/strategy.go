@@ -33,8 +33,6 @@ func init() {
 }
 
 type Strategy struct {
-	*bbgo.Graceful
-	*bbgo.Notifiability
 	*bbgo.Persistence
 	Environment *bbgo.Environment
 
@@ -103,7 +101,7 @@ type Strategy struct {
 	CoveredPosition fixedpoint.Value `json:"coveredPosition,omitempty" persistence:"covered_position"`
 
 	book              *types.StreamOrderBook
-	activeMakerOrders *bbgo.LocalActiveOrderBook
+	activeMakerOrders *bbgo.ActiveOrderBook
 
 	hedgeErrorLimiter         *rate.Limiter
 	hedgeErrorRateReservation *rate.Reservation
@@ -176,7 +174,7 @@ func (s *Strategy) updateQuote(ctx context.Context, orderExecutionRouter bbgo.Or
 		return
 	}
 
-	if s.activeMakerOrders.NumOfAsks() > 0 || s.activeMakerOrders.NumOfBids() > 0 {
+	if s.activeMakerOrders.NumOfOrders() > 0 {
 		return
 	}
 
@@ -307,14 +305,21 @@ func (s *Strategy) updateQuote(ctx context.Context, orderExecutionRouter bbgo.Or
 	var pips = s.Pips
 
 	if s.EnableBollBandMargin {
-		lastDownBand := s.boll.LastDownBand()
-		lastUpBand := s.boll.LastUpBand()
+		lastDownBand := fixedpoint.NewFromFloat(s.boll.DownBand.Last())
+		lastUpBand := fixedpoint.NewFromFloat(s.boll.UpBand.Last())
+
+		if lastUpBand.IsZero() || lastDownBand.IsZero() {
+			log.Warnf("bollinger band value is zero, skipping")
+			return
+		}
+
+		log.Infof("bollinger band: up/down = %f/%f", lastUpBand.Float64(), lastDownBand.Float64())
 
 		// when bid price is lower than the down band, then it's in the downtrend
 		// when ask price is higher than the up band, then it's in the uptrend
-		if bestBidPrice.Float64() < lastDownBand {
+		if bestBidPrice.Compare(lastDownBand) < 0 {
 			// ratio here should be greater than 1.00
-			ratio := fixedpoint.NewFromFloat(lastDownBand).Div(bestBidPrice)
+			ratio := lastDownBand.Div(bestBidPrice)
 
 			// so that the original bid margin can be multiplied by 1.x
 			bollMargin := s.BollBandMargin.Mul(ratio).Mul(s.BollBandMarginFactor)
@@ -329,9 +334,9 @@ func (s *Strategy) updateQuote(ctx context.Context, orderExecutionRouter bbgo.Or
 			pips = pips.Mul(ratio)
 		}
 
-		if bestAskPrice.Float64() > lastUpBand {
+		if bestAskPrice.Compare(lastUpBand) > 0 {
 			// ratio here should be greater than 1.00
-			ratio := bestAskPrice.Div(fixedpoint.NewFromFloat(lastUpBand))
+			ratio := bestAskPrice.Div(lastUpBand)
 
 			// so that the original bid margin can be multiplied by 1.x
 			bollMargin := s.BollBandMargin.Mul(ratio).Mul(s.BollBandMarginFactor)
@@ -549,13 +554,13 @@ func (s *Strategy) Hedge(ctx context.Context, pos fixedpoint.Value) {
 		if !s.hedgeErrorRateReservation.OK() {
 			return
 		}
-		s.Notify("Hit hedge error rate limit, waiting...")
+		bbgo.Notify("Hit hedge error rate limit, waiting...")
 		time.Sleep(s.hedgeErrorRateReservation.Delay())
 		s.hedgeErrorRateReservation = nil
 	}
 
 	log.Infof("submitting %s hedge order %s %v", s.Symbol, side.String(), quantity)
-	s.Notifiability.Notify("Submitting %s hedge order %s %v", s.Symbol, side.String(), quantity)
+	bbgo.Notify("Submitting %s hedge order %s %v", s.Symbol, side.String(), quantity)
 	orderExecutor := &bbgo.ExchangeOrderExecutor{Session: s.sourceSession}
 	returnOrders, err := orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
 		Market:   s.sourceMarket,
@@ -686,6 +691,14 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 		Window:   21,
 	}, 1.0)
 
+	if store, ok := s.sourceSession.MarketDataStore(s.Symbol); ok {
+		if klines, ok2 := store.KLinesOfInterval(s.BollBandInterval); ok2 {
+			for i := 0; i < len(*klines); i++ {
+				s.boll.CalculateAndUpdate((*klines)[0 : i+1])
+			}
+		}
+	}
+
 	// restore state
 	instanceID := s.InstanceID()
 	s.groupID = util.FNV32(instanceID)
@@ -693,8 +706,6 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 
 	if err := s.LoadState(); err != nil {
 		return err
-	} else {
-		s.Notify("xmaker: %s position is restored", s.Symbol, s.Position)
 	}
 
 	if s.Position == nil {
@@ -707,6 +718,8 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 		// force update for legacy code
 		s.Position.Market = s.makerMarket
 	}
+
+	bbgo.Notify("xmaker: %s position is restored", s.Symbol, s.Position)
 
 	if s.ProfitStats == nil {
 		if s.state != nil {
@@ -743,7 +756,7 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 	s.book = types.NewStreamBook(s.Symbol)
 	s.book.BindStream(s.sourceSession.MarketDataStream)
 
-	s.activeMakerOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	s.activeMakerOrders = bbgo.NewActiveOrderBook(s.Symbol)
 	s.activeMakerOrders.BindStream(s.makerSession.UserDataStream)
 
 	s.orderStore = bbgo.NewOrderStore(s.Symbol)
@@ -754,7 +767,7 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 
 	if s.NotifyTrade {
 		s.tradeCollector.OnTrade(func(trade types.Trade, profit, netProfit fixedpoint.Value) {
-			s.Notifiability.Notify(trade)
+			bbgo.Notify(trade)
 		})
 	}
 
@@ -774,7 +787,7 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 			p := s.Position.NewProfit(trade, profit, netProfit)
 			p.Strategy = ID
 			p.StrategyInstanceID = instanceID
-			s.Notify(&p)
+			bbgo.Notify(&p)
 			s.ProfitStats.AddProfit(p)
 
 			s.Environment.RecordPosition(s.Position, trade, &p)
@@ -782,10 +795,10 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 	})
 
 	s.tradeCollector.OnPositionUpdate(func(position *types.Position) {
-		s.Notifiability.Notify(position)
+		bbgo.Notify(position)
 	})
 	s.tradeCollector.OnRecover(func(trade types.Trade) {
-		s.Notifiability.Notify("Recover trade", trade)
+		bbgo.Notify("Recover trade", trade)
 	})
 	s.tradeCollector.BindStream(s.sourceSession.UserDataStream)
 	s.tradeCollector.BindStream(s.makerSession.UserDataStream)
@@ -807,8 +820,7 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 		defer tradeScanTicker.Stop()
 
 		defer func() {
-			if err := s.activeMakerOrders.GracefulCancel(context.Background(),
-				s.makerSession.Exchange); err != nil {
+			if err := s.activeMakerOrders.GracefulCancel(context.Background(), s.makerSession.Exchange); err != nil {
 				log.WithError(err).Errorf("can not cancel %s orders", s.Symbol)
 			}
 		}()
@@ -828,7 +840,7 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 				s.updateQuote(ctx, orderExecutionRouter)
 
 			case <-reportTicker.C:
-				s.Notifiability.Notify(&s.ProfitStats)
+				bbgo.Notify(&s.ProfitStats)
 
 			case <-tradeScanTicker.C:
 				log.Infof("scanning trades from %s ago...", tradeScanInterval)
@@ -868,7 +880,7 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 		}
 	}()
 
-	s.Graceful.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
+	bbgo.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
 		defer wg.Done()
 
 		close(s.stopC)
@@ -883,7 +895,7 @@ func (s *Strategy) CrossRun(ctx context.Context, orderExecutionRouter bbgo.Order
 			log.WithError(err).Errorf("graceful cancel error")
 		}
 
-		s.Notify("%s: %s position", ID, s.Symbol, s.Position)
+		bbgo.Notify("%s: %s position", ID, s.Symbol, s.Position)
 	})
 
 	return nil

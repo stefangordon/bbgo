@@ -9,6 +9,7 @@ import (
 
 //go:generate callbackgen -type ATR
 type ATR struct {
+	types.SeriesBase
 	types.IntervalWindow
 	PercentageVolatility types.Float64Slice
 
@@ -19,13 +20,19 @@ type ATR struct {
 	UpdateCallbacks []func(value float64)
 }
 
+var _ types.SeriesExtend = &ATR{}
+
 func (inc *ATR) Update(high, low, cloze float64) {
 	if inc.Window <= 0 {
 		panic("window must be greater than 0")
 	}
 
 	if inc.RMA == nil {
-		inc.RMA = &RMA{IntervalWindow: types.IntervalWindow{Window: inc.Window}}
+		inc.SeriesBase.Series = inc
+		inc.RMA = &RMA{
+			IntervalWindow: types.IntervalWindow{Window: inc.Window},
+			Adjust:         true,
+		}
 		inc.PreviousClose = cloze
 		return
 	}
@@ -67,17 +74,20 @@ func (inc *ATR) Length() int {
 	if inc.RMA == nil {
 		return 0
 	}
+
 	return inc.RMA.Length()
 }
 
-var _ types.Series = &ATR{}
+func (inc *ATR) PushK(k types.KLine) {
+	inc.Update(k.High.Float64(), k.Low.Float64(), k.Close.Float64())
+}
 
-func (inc *ATR) calculateAndUpdate(kLines []types.KLine) {
+func (inc *ATR) CalculateAndUpdate(kLines []types.KLine) {
 	for _, k := range kLines {
 		if inc.EndTime != zeroTime && !k.EndTime.After(inc.EndTime) {
 			continue
 		}
-		inc.Update(k.High.Float64(), k.Low.Float64(), k.Close.Float64())
+		inc.PushK(k)
 	}
 
 	inc.EmitUpdate(inc.Last())
@@ -89,7 +99,7 @@ func (inc *ATR) handleKLineWindowUpdate(interval types.Interval, window types.KL
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *ATR) Bind(updater KLineWindowUpdater) {

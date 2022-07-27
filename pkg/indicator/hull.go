@@ -10,16 +10,18 @@ import (
 // Refer URL: https://fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/hull-moving-average
 //go:generate callbackgen -type HULL
 type HULL struct {
+	types.SeriesBase
 	types.IntervalWindow
 	ma1    *EWMA
 	ma2    *EWMA
 	result *EWMA
 
-	UpdateCallbacks []func(value float64)
+	updateCallbacks []func(value float64)
 }
 
 func (inc *HULL) Update(value float64) {
 	if inc.result == nil {
+		inc.SeriesBase.Series = inc
 		inc.ma1 = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, inc.Window / 2}}
 		inc.ma2 = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, inc.Window}}
 		inc.result = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, int(math.Sqrt(float64(inc.Window)))}}
@@ -50,10 +52,10 @@ func (inc *HULL) Length() int {
 	return inc.result.Length()
 }
 
-var _ types.Series = &HULL{}
+var _ types.SeriesExtend = &HULL{}
 
 // TODO: should we just ignore the possible overlapping?
-func (inc *HULL) calculateAndUpdate(allKLines []types.KLine) {
+func (inc *HULL) CalculateAndUpdate(allKLines []types.KLine) {
 	doable := false
 	if inc.ma1 == nil || inc.ma1.Length() == 0 {
 		doable = true
@@ -74,7 +76,7 @@ func (inc *HULL) handleKLineWindowUpdate(interval types.Interval, window types.K
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *HULL) Bind(updater KLineWindowUpdater) {

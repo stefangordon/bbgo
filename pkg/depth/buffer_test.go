@@ -1,3 +1,6 @@
+//go:build !race
+// +build !race
+
 package depth
 
 import (
@@ -5,9 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
-	"github.com/stretchr/testify/assert"
 )
 
 var itov = fixedpoint.NewFromInt
@@ -23,6 +27,7 @@ func TestDepthBuffer_ReadyState(t *testing.T) {
 			},
 		}, 33, nil
 	})
+	buf.SetBufferingPeriod(time.Millisecond * 5)
 
 	readyC := make(chan struct{})
 	buf.OnReady(func(snapshot types.SliceOrderBook, updates []Update) {

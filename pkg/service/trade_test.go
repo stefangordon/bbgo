@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -20,8 +19,6 @@ func Test_tradeService(t *testing.T) {
 
 	defer db.Close()
 
-	ctx := context.Background()
-
 	xdb := sqlx.NewDb(db.DB, "sqlite3")
 	service := &TradeService{DB: xdb}
 
@@ -38,24 +35,6 @@ func Test_tradeService(t *testing.T) {
 		Time:          types.Time(time.Now()),
 	})
 	assert.NoError(t, err)
-
-	err = service.Mark(ctx, 1, "grid")
-	assert.NoError(t, err)
-
-	tradeRecord, err := service.Load(ctx, 1)
-	assert.NoError(t, err)
-	assert.NotNil(t, tradeRecord)
-	assert.True(t, tradeRecord.StrategyID.Valid)
-	assert.Equal(t, "grid", tradeRecord.StrategyID.String)
-
-	err = service.UpdatePnL(ctx, 1, 10.0)
-	assert.NoError(t, err)
-
-	tradeRecord, err = service.Load(ctx, 1)
-	assert.NoError(t, err)
-	assert.NotNil(t, tradeRecord)
-	assert.True(t, tradeRecord.PnL.Valid)
-	assert.Equal(t, 10.0, tradeRecord.PnL.Float64)
 }
 
 func Test_queryTradingVolumeSQL(t *testing.T) {

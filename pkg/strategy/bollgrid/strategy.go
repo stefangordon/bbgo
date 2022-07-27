@@ -25,10 +25,6 @@ func init() {
 }
 
 type Strategy struct {
-	// The notification system will be injected into the strategy automatically.
-	// This field will be injected automatically since it's a single exchange strategy.
-	*bbgo.Notifiability
-
 	// OrderExecutor is an interface for submitting order.
 	// This field will be injected automatically since it's a single exchange strategy.
 	bbgo.OrderExecutor
@@ -44,9 +40,6 @@ type Strategy struct {
 	// StandardIndicatorSet contains the standard indicators of a market (symbol)
 	// This field will be injected automatically since we defined the Symbol field.
 	*bbgo.StandardIndicatorSet
-
-	// Graceful let you define the graceful shutdown handler
-	*bbgo.Graceful
 
 	// Market stores the configuration of the market, for example, VolumePrecision, PricePrecision, MinLotSize... etc
 	// This field will be injected automatically since we defined the Symbol field.
@@ -74,9 +67,9 @@ type Strategy struct {
 	Quantity fixedpoint.Value `json:"quantity"`
 
 	// activeOrders is the locally maintained active order book of the maker orders.
-	activeOrders *bbgo.LocalActiveOrderBook
+	activeOrders *bbgo.ActiveOrderBook
 
-	profitOrders *bbgo.LocalActiveOrderBook
+	profitOrders *bbgo.ActiveOrderBook
 
 	orders *bbgo.OrderStore
 
@@ -341,20 +334,20 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	s.orders.BindStream(session.UserDataStream)
 
 	// we don't persist orders so that we can not clear the previous orders for now. just need time to support this.
-	s.activeOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	s.activeOrders = bbgo.NewActiveOrderBook(s.Symbol)
 	s.activeOrders.OnFilled(func(o types.Order) {
 		s.submitReverseOrder(o, session)
 	})
 	s.activeOrders.BindStream(session.UserDataStream)
 
-	s.profitOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	s.profitOrders = bbgo.NewActiveOrderBook(s.Symbol)
 	s.profitOrders.OnFilled(func(o types.Order) {
 		// we made profit here!
 	})
 	s.profitOrders.BindStream(session.UserDataStream)
 
 	// setup graceful shutting down handler
-	s.Graceful.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
+	bbgo.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
 		// call Done to notify the main process.
 		defer wg.Done()
 		log.Infof("canceling active orders...")

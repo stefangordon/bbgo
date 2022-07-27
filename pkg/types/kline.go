@@ -563,6 +563,8 @@ type KLineSeries struct {
 func (k *KLineSeries) Last() float64 {
 	length := len(*k.lines)
 	switch k.kv {
+	case kOpUnknown:
+		panic("kline series operator unknown")
 	case kOpenValue:
 		return (*k.lines)[length-1].GetOpen().Float64()
 	case kCloseValue:
@@ -602,3 +604,14 @@ func (k *KLineSeries) Length() int {
 }
 
 var _ Series = &KLineSeries{}
+
+type KLineCallBack func(k KLine)
+
+func KLineWith(symbol string, interval Interval, callback KLineCallBack) KLineCallBack {
+	return func(k KLine) {
+		if k.Symbol != symbol || (k.Interval != "" && k.Interval != interval) {
+			return
+		}
+		callback(k)
+	}
+}

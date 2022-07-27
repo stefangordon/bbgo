@@ -112,17 +112,33 @@ func (p *Position) NewProfit(trade Trade, profit, netProfit fixedpoint.Value) Pr
 		Fee:         trade.Fee,
 		FeeCurrency: trade.FeeCurrency,
 
-		Exchange:   trade.Exchange,
-		IsMargin:   trade.IsMargin,
-		IsFutures:  trade.IsFutures,
-		IsIsolated: trade.IsIsolated,
-		TradedAt:   trade.Time.Time(),
+		Exchange:           trade.Exchange,
+		IsMargin:           trade.IsMargin,
+		IsFutures:          trade.IsFutures,
+		IsIsolated:         trade.IsIsolated,
+		TradedAt:           trade.Time.Time(),
+		Strategy:           p.Strategy,
+		StrategyInstanceID: p.StrategyInstanceID,
 	}
 }
 
-func (p *Position) NewClosePositionOrder(percentage fixedpoint.Value) *SubmitOrder {
+// ROI -- Return on investment (ROI) is a performance measure used to evaluate the efficiency or profitability of an investment
+// or compare the efficiency of a number of different investments.
+// ROI tries to directly measure the amount of return on a particular investment, relative to the investment's cost.
+func (p *Position) ROI(price fixedpoint.Value) fixedpoint.Value {
+	unrealizedProfit := p.UnrealizedProfit(price)
+	cost := p.AverageCost.Mul(p.Base.Abs())
+	return unrealizedProfit.Div(cost)
+}
+
+func (p *Position) NewMarketCloseOrder(percentage fixedpoint.Value) *SubmitOrder {
 	base := p.GetBase()
-	quantity := base.Mul(percentage).Abs()
+
+	quantity := base.Abs()
+	if percentage.Compare(fixedpoint.One) < 0 {
+		quantity = quantity.Mul(percentage)
+	}
+
 	if quantity.Compare(p.Market.MinQuantity) < 0 {
 		return nil
 	}
@@ -158,13 +174,18 @@ func (p *Position) GetBase() (base fixedpoint.Value) {
 	return base
 }
 
-func (p *Position) UnrealizedProfit(price fixedpoint.Value) fixedpoint.Value {
+func (p *Position) GetQuantity() fixedpoint.Value {
 	base := p.GetBase()
+	return base.Abs()
+}
+
+func (p *Position) UnrealizedProfit(price fixedpoint.Value) fixedpoint.Value {
+	quantity := p.GetBase().Abs()
 
 	if p.IsLong() {
-		return price.Sub(p.AverageCost).Mul(base)
+		return price.Sub(p.AverageCost).Mul(quantity)
 	} else if p.IsShort() {
-		return p.AverageCost.Sub(price).Mul(base)
+		return p.AverageCost.Sub(price).Mul(quantity)
 	}
 
 	return fixedpoint.Zero
@@ -197,6 +218,10 @@ type FuturesPosition struct {
 }
 
 func NewPositionFromMarket(market Market) *Position {
+	if len(market.BaseCurrency) == 0 || len(market.QuoteCurrency) == 0 {
+		panic("logical exception: missing market information, base currency or quote currency is empty")
+	}
+
 	return &Position{
 		Symbol:        market.Symbol,
 		BaseCurrency:  market.BaseCurrency,
@@ -250,6 +275,10 @@ func (p *Position) IsLong() bool {
 
 func (p *Position) IsClosed() bool {
 	return p.Base.Sign() == 0
+}
+
+func (p *Position) IsOpened(currentPrice fixedpoint.Value) bool {
+	return !p.IsClosed() && !p.IsDust(currentPrice)
 }
 
 func (p *Position) Type() PositionType {
@@ -368,30 +397,36 @@ func (p *Position) AddTrade(td Trade) (profit fixedpoint.Value, netProfit fixedp
 
 	// calculated fee in quote (some exchange accounts may enable platform currency fee discount, like BNB)
 	// convert platform fee token into USD values
-	var feeInQuote fixedpoint.Value = fixedpoint.Zero
+	var feeInQuote = fixedpoint.Zero
 
 	switch td.FeeCurrency {
 
 	case p.BaseCurrency:
-		quantity = quantity.Sub(fee)
+		if !td.IsFutures {
+			quantity = quantity.Sub(fee)
+		}
 
 	case p.QuoteCurrency:
-		quoteQuantity = quoteQuantity.Sub(fee)
+		if !td.IsFutures {
+			quoteQuantity = quoteQuantity.Sub(fee)
+		}
 
 	default:
-		if p.ExchangeFeeRates != nil {
-			if exchangeFee, ok := p.ExchangeFeeRates[td.Exchange]; ok {
-				if td.IsMaker {
-					feeInQuote = feeInQuote.Add(exchangeFee.MakerFeeRate.Mul(quoteQuantity))
-				} else {
-					feeInQuote = feeInQuote.Add(exchangeFee.TakerFeeRate.Mul(quoteQuantity))
+		if !td.Fee.IsZero() {
+			if p.ExchangeFeeRates != nil {
+				if exchangeFee, ok := p.ExchangeFeeRates[td.Exchange]; ok {
+					if td.IsMaker {
+						feeInQuote = feeInQuote.Add(exchangeFee.MakerFeeRate.Mul(quoteQuantity))
+					} else {
+						feeInQuote = feeInQuote.Add(exchangeFee.TakerFeeRate.Mul(quoteQuantity))
+					}
 				}
-			}
-		} else if p.FeeRate != nil {
-			if td.IsMaker {
-				feeInQuote = feeInQuote.Add(p.FeeRate.MakerFeeRate.Mul(quoteQuantity))
-			} else {
-				feeInQuote = feeInQuote.Add(p.FeeRate.TakerFeeRate.Mul(quoteQuantity))
+			} else if p.FeeRate != nil {
+				if td.IsMaker {
+					feeInQuote = feeInQuote.Add(p.FeeRate.MakerFeeRate.Mul(quoteQuantity))
+				} else {
+					feeInQuote = feeInQuote.Add(p.FeeRate.TakerFeeRate.Mul(quoteQuantity))
+				}
 			}
 		}
 	}

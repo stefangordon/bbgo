@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
+	exchange2 "github.com/c9s/bbgo/pkg/exchange"
 	"github.com/c9s/bbgo/pkg/exchange/batch"
 	"github.com/c9s/bbgo/pkg/types"
 )
@@ -20,12 +20,14 @@ var ErrTradeNotFound = errors.New("trade not found")
 
 type QueryTradesOptions struct {
 	Exchange types.ExchangeName
+	Sessions []string
 	Symbol   string
 	LastGID  int64
+	Since    *time.Time
 
 	// ASC or DESC
 	Ordering string
-	Limit    int
+	Limit    uint64
 }
 
 type TradingVolume struct {
@@ -52,7 +54,7 @@ func NewTradeService(db *sqlx.DB) *TradeService {
 }
 
 func (s *TradeService) Sync(ctx context.Context, exchange types.Exchange, symbol string, startTime time.Time) error {
-	isMargin, isFutures, isIsolated, isolatedSymbol := getExchangeAttributes(exchange)
+	isMargin, isFutures, isIsolated, isolatedSymbol := exchange2.GetSessionAttributes(exchange)
 	// override symbol if isolatedSymbol is not empty
 	if isIsolated && len(isolatedSymbol) > 0 {
 		symbol = isolatedSymbol
@@ -94,6 +96,7 @@ func (s *TradeService) Sync(ctx context.Context, exchange types.Exchange, symbol
 				trade := obj.(types.Trade)
 				return strconv.FormatUint(trade.ID, 10) + trade.Side.String()
 			},
+			LogInsert: true,
 		},
 	}
 
@@ -144,7 +147,7 @@ func (s *TradeService) QueryTradingVolume(startTime time.Time, options TradingVo
 			return records, err
 		}
 
-		record.Time = time.Date(record.Year, time.Month(record.Month), record.Day, 0, 0, 0, 0, time.UTC)
+		record.Time = time.Date(record.Year, time.Month(record.Month), record.Day, 0, 0, 0, 0, time.Local)
 		records = append(records, record)
 	}
 
@@ -249,34 +252,6 @@ func generateMysqlTradingVolumeQuerySQL(options TradingVolumeQueryOptions) strin
 	return sql
 }
 
-// QueryLast queries the last trade from the database
-func (s *TradeService) QueryLast(ex types.ExchangeName, symbol string, isMargin, isFutures, isIsolated bool, limit int) ([]types.Trade, error) {
-	log.Debugf("querying last trade exchange = %s AND symbol = %s AND is_margin = %v AND is_futures = %v AND is_isolated = %v", ex, symbol, isMargin, isFutures, isIsolated)
-
-	sql := "SELECT * FROM trades WHERE exchange = :exchange AND symbol = :symbol AND is_margin = :is_margin AND is_futures = :is_futures AND is_isolated = :is_isolated ORDER BY traded_at DESC LIMIT :limit"
-	rows, err := s.DB.NamedQuery(sql, map[string]interface{}{
-		"symbol":      symbol,
-		"exchange":    ex,
-		"is_margin":   isMargin,
-		"is_futures":  isFutures,
-		"is_isolated": isIsolated,
-		"limit":       limit,
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "query last trade error")
-	}
-
-	defer rows.Close()
-
-	trades, err := s.scanRows(rows)
-	if err != nil {
-		return nil, err
-	}
-
-	trades = types.SortTradesAscending(trades)
-	return trades, nil
-}
-
 func (s *TradeService) QueryForTradingFeeCurrency(ex types.ExchangeName, symbol string, feeCurrency string) ([]types.Trade, error) {
 	sql := "SELECT * FROM trades WHERE exchange = :exchange AND (symbol = :symbol OR fee_currency = :fee_currency) ORDER BY traded_at ASC"
 	rows, err := s.DB.NamedQuery(sql, map[string]interface{}{
@@ -294,13 +269,43 @@ func (s *TradeService) QueryForTradingFeeCurrency(ex types.ExchangeName, symbol 
 }
 
 func (s *TradeService) Query(options QueryTradesOptions) ([]types.Trade, error) {
-	sql := queryTradesSQL(options)
-	args := map[string]interface{}{
-		"exchange": options.Exchange,
-		"symbol":   options.Symbol,
+	sel := sq.Select("*").
+		From("trades")
+
+	if options.Since != nil {
+		sel = sel.Where(sq.GtOrEq{"traded_at": options.Since})
 	}
 
-	rows, err := s.DB.NamedQuery(sql, args)
+	sel = sel.Where(sq.Eq{"symbol": options.Symbol})
+
+	if options.Exchange != "" {
+		sel = sel.Where(sq.Eq{"exchange": options.Exchange})
+	}
+
+	if len(options.Sessions) > 0 {
+		// FIXME: right now we only have the exchange field in the db, we might need to add the session field too.
+		sel = sel.Where(sq.Eq{"exchange": options.Sessions})
+	}
+
+	if options.Ordering != "" {
+		sel = sel.OrderBy("traded_at " + options.Ordering)
+	} else {
+		sel = sel.OrderBy("traded_at ASC")
+	}
+
+	if options.Limit > 0 {
+		sel = sel.Limit(options.Limit)
+	}
+
+	sql, args, err := sel.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debug(sql)
+	log.Debug(args)
+
+	rows, err := s.DB.Queryx(sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -328,49 +333,6 @@ func (s *TradeService) Load(ctx context.Context, id int64) (*types.Trade, error)
 	}
 
 	return nil, errors.Wrapf(ErrTradeNotFound, "trade id:%d not found", id)
-}
-
-func (s *TradeService) Mark(ctx context.Context, id int64, strategyID string) error {
-	result, err := s.DB.NamedExecContext(ctx, "UPDATE `trades` SET `strategy` = :strategy WHERE `id` = :id", map[string]interface{}{
-		"id":       id,
-		"strategy": strategyID,
-	})
-	if err != nil {
-		return err
-	}
-
-	cnt, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if cnt == 0 {
-		return fmt.Errorf("trade id:%d not found", id)
-	}
-
-	return nil
-}
-
-func (s *TradeService) UpdatePnL(ctx context.Context, id int64, pnl float64) error {
-	result, err := s.DB.NamedExecContext(ctx, "UPDATE `trades` SET `pnl` = :pnl WHERE `id` = :id", map[string]interface{}{
-		"id":  id,
-		"pnl": pnl,
-	})
-	if err != nil {
-		return err
-	}
-
-	cnt, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if cnt == 0 {
-		return fmt.Errorf("trade id:%d not found", id)
-	}
-
-	return nil
-
 }
 
 func queryTradesSQL(options QueryTradesOptions) string {
@@ -407,7 +369,7 @@ func queryTradesSQL(options QueryTradesOptions) string {
 	sql += ` ORDER BY gid ` + ordering
 
 	if options.Limit > 0 {
-		sql += ` LIMIT ` + strconv.Itoa(options.Limit)
+		sql += ` LIMIT ` + strconv.FormatUint(options.Limit, 10)
 	}
 
 	return sql
@@ -451,28 +413,3 @@ func SelectLastTrades(ex types.ExchangeName, symbol string, isMargin, isFutures,
 		Limit(limit)
 }
 
-func getExchangeAttributes(exchange types.Exchange) (isMargin, isFutures, isIsolated bool, isolatedSymbol string) {
-	if marginExchange, ok := exchange.(types.MarginExchange); ok {
-		marginSettings := marginExchange.GetMarginSettings()
-		isMargin = marginSettings.IsMargin
-		if isMargin {
-			isIsolated = marginSettings.IsIsolatedMargin
-			if marginSettings.IsIsolatedMargin {
-				isolatedSymbol = marginSettings.IsolatedMarginSymbol
-			}
-		}
-	}
-
-	if futuresExchange, ok := exchange.(types.FuturesExchange); ok {
-		futuresSettings := futuresExchange.GetFuturesSettings()
-		isFutures = futuresSettings.IsFutures
-		if isFutures {
-			isIsolated = futuresSettings.IsIsolatedFutures
-			if futuresSettings.IsIsolatedFutures {
-				isolatedSymbol = futuresSettings.IsolatedFuturesSymbol
-			}
-		}
-	}
-
-	return isMargin, isFutures, isIsolated, isolatedSymbol
-}

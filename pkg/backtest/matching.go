@@ -11,6 +11,7 @@ import (
 
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
+	"github.com/c9s/bbgo/pkg/util"
 )
 
 var orderID uint64 = 1
@@ -24,7 +25,27 @@ func incTradeID() uint64 {
 	return atomic.AddUint64(&tradeID, 1)
 }
 
-var klineMatchingLogger = logrus.WithField("backtest", "klineEngine")
+var klineMatchingLogger *logrus.Entry = nil
+
+// FeeToken is used to simulate the exchange platform fee token
+// This is to ease the back-testing environment for closing positions.
+const FeeToken = "FEE"
+
+var useFeeToken = true
+
+func init() {
+	logger := logrus.New()
+	if v, ok := util.GetEnvVarBool("DEBUG_MATCHING"); ok && v {
+		logger.SetLevel(logrus.DebugLevel)
+	} else {
+		logger.SetLevel(logrus.ErrorLevel)
+	}
+	klineMatchingLogger = logger.WithField("backtest", "klineEngine")
+
+	if v, ok := util.GetEnvVarBool("BACKTEST_USE_FEE_TOKEN"); ok {
+		useFeeToken = v
+	}
+}
 
 // SimplePriceMatching implements a simple kline data driven matching engine for backtest
 //go:generate callbackgen -type SimplePriceMatching
@@ -35,7 +56,7 @@ type SimplePriceMatching struct {
 	mu           sync.Mutex
 	bidOrders    []types.Order
 	askOrders    []types.Order
-	closedOrders []types.Order
+	closedOrders map[uint64]types.Order
 
 	LastPrice   fixedpoint.Value
 	LastKLine   types.KLine
@@ -78,7 +99,6 @@ func (m *SimplePriceMatching) CancelOrder(o types.Order) (types.Order, error) {
 		}
 		m.askOrders = orders
 		m.mu.Unlock()
-
 	}
 
 	if !found {
@@ -103,18 +123,28 @@ func (m *SimplePriceMatching) CancelOrder(o types.Order) (types.Order, error) {
 	return o, nil
 }
 
-func (m *SimplePriceMatching) PlaceOrder(o types.SubmitOrder) (closedOrders *types.Order, trades *types.Trade, err error) {
+// PlaceOrder returns the created order object, executed trade (if any) and error
+func (m *SimplePriceMatching) PlaceOrder(o types.SubmitOrder) (*types.Order, *types.Trade, error) {
+	if o.Type == types.OrderTypeMarket {
+		if m.LastPrice.IsZero() {
+			panic("unexpected error: for market order, the last price can not be zero")
+		}
+	}
+
+	isTaker := o.Type == types.OrderTypeMarket || isLimitTakerOrder(o, m.LastPrice)
+
 	// price for checking account balance, default price
 	price := o.Price
 
 	switch o.Type {
 	case types.OrderTypeMarket:
-		if m.LastPrice.IsZero() {
-			panic("unexpected: last price can not be zero")
-		}
-
 		price = m.LastPrice
-	case types.OrderTypeLimit, types.OrderTypeLimitMaker:
+
+	case types.OrderTypeStopMarket:
+		// the actual price might be different.
+		price = o.StopPrice
+
+	case types.OrderTypeLimit, types.OrderTypeStopLimit, types.OrderTypeLimitMaker:
 		price = o.Price
 	}
 
@@ -145,23 +175,34 @@ func (m *SimplePriceMatching) PlaceOrder(o types.SubmitOrder) (closedOrders *typ
 	orderID := incOrderID()
 	order := m.newOrder(o, orderID)
 
-	if o.Type == types.OrderTypeMarket {
+	if isTaker {
+		if order.Type == types.OrderTypeMarket {
+			order.Price = m.LastPrice
+		}
+
+		// emit the order update for Status:New
 		m.EmitOrderUpdate(order)
 
+		// copy the order object to avoid side effect (for different callbacks)
+		var order2 = order
+
 		// emit trade before we publish order
-		trade := m.newTradeFromOrder(&order, false)
+		trade := m.newTradeFromOrder(&order2, false, m.LastPrice)
 		m.executeTrade(trade)
 
 		// update the order status
-		order.Status = types.OrderStatusFilled
-		order.ExecutedQuantity = order.Quantity
-		order.Price = price
-		order.IsWorking = false
-		m.EmitOrderUpdate(order)
-		return &order, &trade, nil
+		order2.Status = types.OrderStatusFilled
+		order2.ExecutedQuantity = order2.Quantity
+		order2.IsWorking = false
+
+		m.EmitOrderUpdate(order2)
+
+		// let the exchange emit the "FILLED" order update (we need the closed order)
+		// m.EmitOrderUpdate(order2)
+		return &order2, &trade, nil
 	}
 
-	// for limit maker orders
+	// For limit maker orders (open status)
 	// TODO: handle limit taker order
 	switch o.Side {
 
@@ -176,8 +217,7 @@ func (m *SimplePriceMatching) PlaceOrder(o types.SubmitOrder) (closedOrders *typ
 		m.mu.Unlock()
 	}
 
-	m.EmitOrderUpdate(order)
-
+	m.EmitOrderUpdate(order) // emit order New status
 	return &order, nil, nil
 }
 
@@ -185,11 +225,24 @@ func (m *SimplePriceMatching) executeTrade(trade types.Trade) {
 	var err error
 	// execute trade, update account balances
 	if trade.IsBuyer {
-		err = m.Account.UseLockedBalance(m.Market.QuoteCurrency, trade.Price.Mul(trade.Quantity))
-		m.Account.AddBalance(m.Market.BaseCurrency, trade.Quantity.Sub(trade.Fee.Div(trade.Price)))
+		err = m.Account.UseLockedBalance(m.Market.QuoteCurrency, trade.QuoteQuantity)
+
+		// here the fee currency is the base currency
+		q := trade.Quantity
+		if trade.FeeCurrency == m.Market.BaseCurrency {
+			q = q.Sub(trade.Fee)
+		}
+
+		m.Account.AddBalance(m.Market.BaseCurrency, q)
 	} else {
 		err = m.Account.UseLockedBalance(m.Market.BaseCurrency, trade.Quantity)
-		m.Account.AddBalance(m.Market.QuoteCurrency, trade.Quantity.Mul(trade.Price).Sub(trade.Fee))
+
+		// here the fee currency is the quote currency
+		qq := trade.QuoteQuantity
+		if trade.FeeCurrency == m.Market.QuoteCurrency {
+			qq = qq.Sub(trade.Fee)
+		}
+		m.Account.AddBalance(m.Market.QuoteCurrency, qq)
 	}
 
 	if err != nil {
@@ -198,42 +251,32 @@ func (m *SimplePriceMatching) executeTrade(trade types.Trade) {
 
 	m.EmitTradeUpdate(trade)
 	m.EmitBalanceUpdate(m.Account.Balances())
-	return
 }
 
-func (m *SimplePriceMatching) newTradeFromOrder(order *types.Order, isMaker bool) types.Trade {
+func (m *SimplePriceMatching) getFeeRate(isMaker bool) (feeRate fixedpoint.Value) {
 	// BINANCE uses 0.1% for both maker and taker
 	// MAX uses 0.050% for maker and 0.15% for taker
-	var feeRate fixedpoint.Value
 	if isMaker {
 		feeRate = m.Account.MakerFeeRate
 	} else {
 		feeRate = m.Account.TakerFeeRate
 	}
+	return feeRate
+}
 
-	price := order.Price
-	switch order.Type {
-	case types.OrderTypeMarket, types.OrderTypeStopMarket:
-		if m.LastPrice.IsZero() {
-			panic("unexpected: last price can not be zero")
-		}
-
-		price = m.LastPrice
-	}
-
+func (m *SimplePriceMatching) newTradeFromOrder(order *types.Order, isMaker bool, price fixedpoint.Value) types.Trade {
+	// BINANCE uses 0.1% for both maker and taker
+	// MAX uses 0.050% for maker and 0.15% for taker
+	var feeRate = m.getFeeRate(isMaker)
+	var quoteQuantity = order.Quantity.Mul(price)
 	var fee fixedpoint.Value
 	var feeCurrency string
 
-	switch order.Side {
-
-	case types.SideTypeBuy:
-		fee = order.Quantity.Mul(feeRate)
-		feeCurrency = m.Market.BaseCurrency
-
-	case types.SideTypeSell:
-		fee = order.Quantity.Mul(price).Mul(feeRate)
-		feeCurrency = m.Market.QuoteCurrency
-
+	if useFeeToken {
+		feeCurrency = FeeToken
+		fee = quoteQuantity.Mul(feeRate)
+	} else {
+		fee, feeCurrency = calculateNativeOrderFee(order, m.Market, feeRate)
 	}
 
 	// update order time
@@ -243,10 +286,10 @@ func (m *SimplePriceMatching) newTradeFromOrder(order *types.Order, isMaker bool
 	return types.Trade{
 		ID:            id,
 		OrderID:       order.OrderID,
-		Exchange:      "backtest",
+		Exchange:      types.ExchangeBacktest,
 		Price:         price,
 		Quantity:      order.Quantity,
-		QuoteQuantity: order.Quantity.Mul(price),
+		QuoteQuantity: quoteQuantity,
 		Symbol:        order.Symbol,
 		Side:          order.Side,
 		IsBuyer:       order.Side == types.SideTypeBuy,
@@ -257,17 +300,66 @@ func (m *SimplePriceMatching) newTradeFromOrder(order *types.Order, isMaker bool
 	}
 }
 
-func (m *SimplePriceMatching) BuyToPrice(price fixedpoint.Value) (closedOrders []types.Order, trades []types.Trade) {
+// buyToPrice means price go up and the limit sell should be triggered
+func (m *SimplePriceMatching) buyToPrice(price fixedpoint.Value) (closedOrders []types.Order, trades []types.Trade) {
 	klineMatchingLogger.Debugf("kline buy to price %s", price.String())
 
-	var askOrders []types.Order
+	var bidOrders []types.Order
+	for _, o := range m.bidOrders {
+		switch o.Type {
 
+		case types.OrderTypeStopMarket:
+			// the price is still lower than the stop price, we will put the order back to the list
+			if price.Compare(o.StopPrice) < 0 {
+				// not triggering it, put it back
+				bidOrders = append(bidOrders, o)
+				break
+			}
+
+			o.Type = types.OrderTypeMarket
+			o.ExecutedQuantity = o.Quantity
+			o.Price = price
+			o.Status = types.OrderStatusFilled
+			closedOrders = append(closedOrders, o)
+
+		case types.OrderTypeStopLimit:
+			// the price is still lower than the stop price, we will put the order back to the list
+			if price.Compare(o.StopPrice) < 0 {
+				bidOrders = append(bidOrders, o)
+				break
+			}
+
+			// convert this order to limit order
+			// we use value object here, so it's a copy
+			o.Type = types.OrderTypeLimit
+
+			// is it a taker order?
+			// higher than the current price, then it's a taker order
+			if o.Price.Compare(price) >= 0 {
+				// limit buy taker order, move it to the closed order
+				// we assume that we have no price slippage here, so the latest price will be the executed price
+				// TODO: simulate slippage here
+				o.Price = price
+				o.ExecutedQuantity = o.Quantity
+				o.Status = types.OrderStatusFilled
+				closedOrders = append(closedOrders, o)
+			} else {
+				// keep it as a maker order
+				bidOrders = append(bidOrders, o)
+			}
+		default:
+			bidOrders = append(bidOrders, o)
+		}
+	}
+	m.bidOrders = bidOrders
+
+	var askOrders []types.Order
 	for _, o := range m.askOrders {
 		switch o.Type {
 
 		case types.OrderTypeStopMarket:
 			// should we trigger the order
-			if price.Compare(o.StopPrice) <= 0 {
+			if price.Compare(o.StopPrice) < 0 {
 				// not triggering it, put it back
 				askOrders = append(askOrders, o)
 				break
@@ -281,7 +373,7 @@ func (m *SimplePriceMatching) BuyToPrice(price fixedpoint.Value) (closedOrders [
 
 		case types.OrderTypeStopLimit:
 			// should we trigger the order?
-			if price.Compare(o.StopPrice) <= 0 {
+			if price.Compare(o.StopPrice) < 0 {
 				askOrders = append(askOrders, o)
 				break
 			}
@@ -289,10 +381,13 @@ func (m *SimplePriceMatching) BuyToPrice(price fixedpoint.Value) (closedOrders [
 			o.Type = types.OrderTypeLimit
 
 			// is it a taker order?
-			if price.Compare(o.Price) >= 0 {
-				if o.Price.Compare(m.LastKLine.Low) < 0 {
-					o.Price = m.LastKLine.Low
-				}
+			// higher than the current price, then it's a taker order
+			if o.Price.Compare(price) <= 0 {
+				// limit sell order as taker, move it to the closed order
+				// we assume that we have no price slippage here, so the latest price will be the executed price
+				// TODO: simulate slippage here
+				o.Price = price
+
 				o.ExecutedQuantity = o.Quantity
 				o.Status = types.OrderStatusFilled
 				closedOrders = append(closedOrders, o)
@@ -303,9 +398,6 @@ func (m *SimplePriceMatching) BuyToPrice(price fixedpoint.Value) (closedOrders [
 
 		case types.OrderTypeLimit, types.OrderTypeLimitMaker:
 			if price.Compare(o.Price) >= 0 {
-				if o.Price.Compare(m.LastKLine.Low) < 0 {
-					o.Price = m.LastKLine.Low
-				}
 				o.ExecutedQuantity = o.Quantity
 				o.Status = types.OrderStatusFilled
 				closedOrders = append(closedOrders, o)
@@ -324,59 +416,113 @@ func (m *SimplePriceMatching) BuyToPrice(price fixedpoint.Value) (closedOrders [
 
 	for i := range closedOrders {
 		o := closedOrders[i]
-		trade := m.newTradeFromOrder(&o, true)
+		trade := m.newTradeFromOrder(&o, true, o.Price)
 		m.executeTrade(trade)
 		closedOrders[i] = o
 
 		trades = append(trades, trade)
 
 		m.EmitOrderUpdate(o)
+
+		m.closedOrders[o.OrderID] = o
 	}
-	m.closedOrders = append(m.closedOrders, closedOrders...)
 
 	return closedOrders, trades
 }
 
-func (m *SimplePriceMatching) SellToPrice(price fixedpoint.Value) (closedOrders []types.Order, trades []types.Trade) {
+// sellToPrice simulates the price trend in down direction.
+// When price goes down, buy orders should be executed, and the stop orders should be triggered.
+func (m *SimplePriceMatching) sellToPrice(price fixedpoint.Value) (closedOrders []types.Order, trades []types.Trade) {
 	klineMatchingLogger.Debugf("kline sell to price %s", price.String())
 
-	var sellPrice = price
+	// in this section we handle --- the price goes lower, and we trigger the stop sell
+	var askOrders []types.Order
+	for _, o := range m.askOrders {
+		switch o.Type {
+
+		case types.OrderTypeStopMarket:
+			// should we trigger the order
+			if price.Compare(o.StopPrice) > 0 {
+				askOrders = append(askOrders, o)
+				break
+			}
+
+			o.Type = types.OrderTypeMarket
+			o.ExecutedQuantity = o.Quantity
+			o.Price = price
+			o.Status = types.OrderStatusFilled
+			closedOrders = append(closedOrders, o)
+
+		case types.OrderTypeStopLimit:
+			// if the price is lower than the stop price
+			// we should trigger the stop sell order
+			if price.Compare(o.StopPrice) > 0 {
+				askOrders = append(askOrders, o)
+				break
+			}
+
+			o.Type = types.OrderTypeLimit
+
+			// handle TAKER SELL
+			// if the order price is lower than the current price
+			// it's a taker order
+			if o.Price.Compare(price) <= 0 {
+				o.Price = price
+				o.ExecutedQuantity = o.Quantity
+				o.Status = types.OrderStatusFilled
+				closedOrders = append(closedOrders, o)
+			} else {
+				askOrders = append(askOrders, o)
+			}
+
+		default:
+			askOrders = append(askOrders, o)
+		}
+	}
+	m.askOrders = askOrders
+
 	var bidOrders []types.Order
 	for _, o := range m.bidOrders {
 		switch o.Type {
 
 		case types.OrderTypeStopMarket:
-			// should we trigger the order
-			if sellPrice.Compare(o.StopPrice) <= 0 {
+			// price goes down and if the stop price is still lower than the current price
+			// or the stop price is not touched
+			// then we should skip this order
+			if price.Compare(o.StopPrice) > 0 {
+				bidOrders = append(bidOrders, o)
+				break
+			}
+
+			o.Type = types.OrderTypeMarket
+			o.ExecutedQuantity = o.Quantity
+			o.Price = price
+			o.Status = types.OrderStatusFilled
+			closedOrders = append(closedOrders, o)
+
+		case types.OrderTypeStopLimit:
+			// price goes down and if the stop price is still lower than the current price
+			// or the stop price is not touched
+			// then we should skip this order
+			if price.Compare(o.StopPrice) > 0 {
+				bidOrders = append(bidOrders, o)
+				break
+			}
+
+			o.Type = types.OrderTypeLimit
+
+			// taker order?
+			if o.Price.Compare(price) >= 0 {
+				o.Price = price
 				o.ExecutedQuantity = o.Quantity
-				o.Price = sellPrice
 				o.Status = types.OrderStatusFilled
 				closedOrders = append(closedOrders, o)
 			} else {
 				bidOrders = append(bidOrders, o)
 			}
 
-		case types.OrderTypeStopLimit:
-			// should we trigger the order
-			if sellPrice.Compare(o.StopPrice) <= 0 {
-				o.Type = types.OrderTypeLimit
-
-				if sellPrice.Compare(o.Price) <= 0 {
-					if o.Price.Compare(m.LastKLine.High) > 0 {
-						o.Price = m.LastKLine.High
-					}
-					o.ExecutedQuantity = o.Quantity
-					o.Status = types.OrderStatusFilled
-					closedOrders = append(closedOrders, o)
-				} else {
-					bidOrders = append(bidOrders, o)
-				}
-			} else {
-				bidOrders = append(bidOrders, o)
-			}
-
 		case types.OrderTypeLimit, types.OrderTypeLimitMaker:
-			if sellPrice.Compare(o.Price) <= 0 {
+			if price.Compare(o.Price) <= 0 {
 				o.ExecutedQuantity = o.Quantity
 				o.Status = types.OrderStatusFilled
 				closedOrders = append(closedOrders, o)
@@ -394,63 +540,85 @@ func (m *SimplePriceMatching) SellToPrice(price fixedpoint.Value) (closedOrders 
 
 	for i := range closedOrders {
 		o := closedOrders[i]
-		trade := m.newTradeFromOrder(&o, true)
+		trade := m.newTradeFromOrder(&o, true, o.Price)
 		m.executeTrade(trade)
 		closedOrders[i] = o
 
 		trades = append(trades, trade)
 
 		m.EmitOrderUpdate(o)
+
+		m.closedOrders[o.OrderID] = o
 	}
-	m.closedOrders = append(m.closedOrders, closedOrders...)
 
 	return closedOrders, trades
 }
 
+func (m *SimplePriceMatching) getOrder(orderID uint64) (types.Order, bool) {
+	if o, ok := m.closedOrders[orderID]; ok {
+		return o, true
+	}
+
+	for _, o := range m.bidOrders {
+		if o.OrderID == orderID {
+			return o, true
+		}
+	}
+
+	for _, o := range m.askOrders {
+		if o.OrderID == orderID {
+			return o, true
+		}
+	}
+
+	return types.Order{}, false
+}
+
 func (m *SimplePriceMatching) processKLine(kline types.KLine) {
 	m.CurrentTime = kline.EndTime.Time()
-	m.LastKLine = kline
+
 	if m.LastPrice.IsZero() {
 		m.LastPrice = kline.Open
 	} else {
 		if m.LastPrice.Compare(kline.Open) > 0 {
-			m.SellToPrice(kline.Open)
+			m.sellToPrice(kline.Open)
 		} else {
-			m.BuyToPrice(kline.Open)
+			m.buyToPrice(kline.Open)
 		}
 	}
 
 	switch kline.Direction() {
 	case types.DirectionDown:
 		if kline.High.Compare(kline.Open) >= 0 {
-			m.BuyToPrice(kline.High)
+			m.buyToPrice(kline.High)
 		}
 
 		// if low is lower than close, sell to low first, and then buy up to close
 		if kline.Low.Compare(kline.Close) < 0 {
-			m.SellToPrice(kline.Low)
-			m.BuyToPrice(kline.Close)
+			m.sellToPrice(kline.Low)
+			m.buyToPrice(kline.Close)
 		} else {
-			m.SellToPrice(kline.Close)
+			m.sellToPrice(kline.Close)
 		}
 
 	case types.DirectionUp:
 		if kline.Low.Compare(kline.Open) <= 0 {
-			m.SellToPrice(kline.Low)
+			m.sellToPrice(kline.Low)
 		}
 
 		if kline.High.Compare(kline.Close) > 0 {
-			m.BuyToPrice(kline.High)
-			m.SellToPrice(kline.Close)
+			m.buyToPrice(kline.High)
+			m.sellToPrice(kline.Close)
 		} else {
-			m.BuyToPrice(kline.Close)
+			m.buyToPrice(kline.Close)
 		}
 	default: // no trade up or down
 		if m.LastPrice.IsZero() {
-			m.BuyToPrice(kline.Close)
+			m.buyToPrice(kline.Close)
 		}
-
 	}
+
+	m.LastKLine = kline
 }
 
 func (m *SimplePriceMatching) newOrder(o types.SubmitOrder, orderID uint64) types.Order {
@@ -464,4 +632,29 @@ func (m *SimplePriceMatching) newOrder(o types.SubmitOrder, orderID uint64) type
 		CreationTime:     types.Time(m.CurrentTime),
 		UpdateTime:       types.Time(m.CurrentTime),
 	}
+}
+
+func calculateNativeOrderFee(order *types.Order, market types.Market, feeRate fixedpoint.Value) (fee fixedpoint.Value, feeCurrency string) {
+	switch order.Side {
+
+	case types.SideTypeBuy:
+		fee = order.Quantity.Mul(feeRate)
+		feeCurrency = market.BaseCurrency
+
+	case types.SideTypeSell:
+		quoteQuantity := order.Quantity.Mul(order.Price)
+		fee = quoteQuantity.Mul(feeRate)
+		feeCurrency = market.QuoteCurrency
+
+	}
+	return fee, feeCurrency
+}
+
+func isLimitTakerOrder(o types.SubmitOrder, currentPrice fixedpoint.Value) bool {
+	if currentPrice.IsZero() {
+		return false
+	}
+
+	return o.Type == types.OrderTypeLimit && ((o.Side == types.SideTypeBuy && o.Price.Compare(currentPrice) >= 0) ||
+		(o.Side == types.SideTypeSell && o.Price.Compare(currentPrice) <= 0))
 }

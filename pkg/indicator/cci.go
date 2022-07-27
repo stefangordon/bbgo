@@ -3,7 +3,6 @@ package indicator
 import (
 	"math"
 
-	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -12,6 +11,7 @@ import (
 // with modification of ddof=0 to let standard deviation to be divided by N instead of N-1
 //go:generate callbackgen -type CCI
 type CCI struct {
+	types.SeriesBase
 	types.IntervalWindow
 	Input        types.Float64Slice
 	TypicalPrice types.Float64Slice
@@ -23,6 +23,7 @@ type CCI struct {
 
 func (inc *CCI) Update(value float64) {
 	if len(inc.TypicalPrice) == 0 {
+		inc.SeriesBase.Series = inc
 		inc.TypicalPrice.Push(value)
 		inc.Input.Push(value)
 		return
@@ -75,19 +76,22 @@ func (inc *CCI) Length() int {
 	return len(inc.Values)
 }
 
-var _ types.Series = &CCI{}
+var _ types.SeriesExtend = &CCI{}
 
-var three = fixedpoint.NewFromInt(3)
 
-func (inc *CCI) calculateAndUpdate(allKLines []types.KLine) {
+func (inc *CCI) PushK(k types.KLine) {
+	inc.Update(k.High.Add(k.Low).Add(k.Close).Div(three).Float64())
+}
+
+func (inc *CCI) CalculateAndUpdate(allKLines []types.KLine) {
 	if inc.TypicalPrice.Length() == 0 {
 		for _, k := range allKLines {
-			inc.Update(k.High.Add(k.Low).Add(k.Close).Div(three).Float64())
+			inc.PushK(k)
 			inc.EmitUpdate(inc.Last())
 		}
 	} else {
 		k := allKLines[len(allKLines)-1]
-		inc.Update(k.High.Add(k.Low).Add(k.Close).Div(three).Float64())
+		inc.PushK(k)
 		inc.EmitUpdate(inc.Last())
 	}
 }
@@ -97,7 +101,7 @@ func (inc *CCI) handleKLineWindowUpdate(interval types.Interval, window types.KL
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *CCI) Bind(updater KLineWindowUpdater) {

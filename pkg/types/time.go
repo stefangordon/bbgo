@@ -115,8 +115,7 @@ func (t *MillisecondTimestamp) UnmarshalJSON(data []byte) error {
 
 	}
 
-	// fallback to RFC3339
-	return (*time.Time)(t).UnmarshalJSON(data)
+	// Unreachable
 }
 
 func convertFloat64ToTime(vt string, f float64) (time.Time, error) {
@@ -166,6 +165,10 @@ func (t Time) UnixMilli() int64 {
 	return time.Time(t).UnixMilli()
 }
 
+func (t Time) Equal(time2 time.Time) bool {
+	return time.Time(t).Equal(time2)
+}
+
 func (t Time) After(time2 time.Time) bool {
 	return time.Time(t).After(time2)
 }
@@ -188,6 +191,11 @@ func (t Time) Value() (driver.Value, error) {
 }
 
 func (t *Time) Scan(src interface{}) error {
+	// skip nil time
+	if src == nil {
+		return nil
+	}
+
 	switch d := src.(type) {
 
 	case *time.Time:
@@ -235,18 +243,47 @@ var looseTimeFormats = []string{
 // LooseFormatTime parses date time string with a wide range of formats.
 type LooseFormatTime time.Time
 
+func ParseLooseFormatTime(s string) (LooseFormatTime, error) {
+	var t time.Time
+	switch s {
+	case "now":
+		t = time.Now()
+		return LooseFormatTime(t), nil
+
+	case "yesterday":
+		t = time.Now().AddDate(0, 0, -1)
+		return LooseFormatTime(t), nil
+
+	case "last month":
+		t = time.Now().AddDate(0, -1, 0)
+		return LooseFormatTime(t), nil
+
+	case "last year":
+		t = time.Now().AddDate(-1, 0, 0)
+		return LooseFormatTime(t), nil
+
+	}
+
+	tv, err := util.ParseTimeWithFormats(s, looseTimeFormats)
+	if err != nil {
+		return LooseFormatTime{}, err
+	}
+
+	return LooseFormatTime(tv), nil
+}
+
 func (t *LooseFormatTime) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var str string
 	if err := unmarshal(&str); err != nil {
 		return err
 	}
 
-	tv, err := util.ParseTimeWithFormats(str, looseTimeFormats)
+	lt, err := ParseLooseFormatTime(str)
 	if err != nil {
 		return err
 	}
 
-	*t = LooseFormatTime(tv)
+	*t = lt
 	return nil
 }
 
@@ -269,7 +306,6 @@ func (t *LooseFormatTime) UnmarshalJSON(data []byte) error {
 func (t LooseFormatTime) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.Quote(time.Time(t).Format(time.RFC3339))), nil
 }
-
 
 func (t LooseFormatTime) Time() time.Time {
 	return time.Time(t)

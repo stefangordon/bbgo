@@ -22,8 +22,10 @@ type Account struct {
 	Locked   fixedpoint.Value `json:"locked"`
 
 	// v3 fields for M wallet
-	Debt     fixedpoint.Value `json:"debt"`
-	Interest fixedpoint.Value `json:"interest"`
+	Debt      fixedpoint.Value `json:"debt"`
+	Principal fixedpoint.Value `json:"principal"`
+	Borrowed  fixedpoint.Value `json:"borrowed"`
+	Interest  fixedpoint.Value `json:"interest"`
 
 	// v2 fields
 	FiatCurrency string           `json:"fiat_currency"`
@@ -99,16 +101,6 @@ type GetAccountsRequest struct {
 
 func (s *AccountService) NewGetAccountsRequest() *GetAccountsRequest {
 	return &GetAccountsRequest{client: s.client}
-}
-
-//go:generate GetRequest -url "v2/members/me" -type GetMeRequest -responseType .UserInfo
-type GetMeRequest struct {
-	client requestgen.AuthenticatedAPIClient
-}
-
-// NewGetMeRequest returns the current user info by the current used MAX key and secret
-func (s *AccountService) NewGetMeRequest() *GetMeRequest {
-	return &GetMeRequest{client: s.client}
 }
 
 type Deposit struct {

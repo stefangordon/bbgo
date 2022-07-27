@@ -19,6 +19,7 @@ func NewRedisPersistenceService(config *RedisPersistenceConfig) *RedisPersistenc
 	client := redis.NewClient(&redis.Options{
 		Addr: net.JoinHostPort(config.Host, config.Port),
 		// Username:           "", // username is only for redis 6.0
+		// pragma: allowlist nextline secret
 		Password: config.Password, // no password set
 		DB:       config.DB,       // use default DB
 	})
@@ -63,7 +64,8 @@ func (store *RedisStore) Load(val interface{}) error {
 		return err
 	}
 
-	if len(data) == 0 {
+	// skip null data
+	if len(data) == 0 || data == "null" {
 		return ErrPersistenceNotExists
 	}
 
@@ -71,6 +73,10 @@ func (store *RedisStore) Load(val interface{}) error {
 }
 
 func (store *RedisStore) Save(val interface{}) error {
+	if val == nil {
+		return nil
+	}
+
 	data, err := json.Marshal(val)
 	if err != nil {
 		return err

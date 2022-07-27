@@ -3,8 +3,6 @@ package rebalance
 import (
 	"context"
 	"fmt"
-	"math"
-	"sort"
 
 	"github.com/sirupsen/logrus"
 
@@ -22,29 +20,18 @@ func init() {
 }
 
 type Strategy struct {
-	Notifiability *bbgo.Notifiability
-
-	Interval      types.Interval              `json:"interval"`
-	BaseCurrency  string                      `json:"baseCurrency"`
-	TargetWeights map[string]fixedpoint.Value `json:"targetWeights"`
-	Threshold     fixedpoint.Value            `json:"threshold"`
-	IgnoreLocked  bool                        `json:"ignoreLocked"`
-	Verbose       bool                        `json:"verbose"`
-	DryRun        bool                        `json:"dryRun"`
+	Interval      types.Interval   `json:"interval"`
+	BaseCurrency  string           `json:"baseCurrency"`
+	TargetWeights types.ValueMap   `json:"targetWeights"`
+	Threshold     fixedpoint.Value `json:"threshold"`
+	DryRun        bool             `json:"dryRun"`
 	// max amount to buy or sell per order
 	MaxAmount fixedpoint.Value `json:"maxAmount"`
 
-	currencies []string
-
-	activeOrderBooks map[string]*bbgo.LocalActiveOrderBook
+	activeOrderBook *bbgo.ActiveOrderBook
 }
 
 func (s *Strategy) Initialize() error {
-	for currency := range s.TargetWeights {
-		s.currencies = append(s.currencies, currency)
-	}
-
-	sort.Strings(s.currencies)
 	return nil
 }
 
@@ -55,6 +42,10 @@ func (s *Strategy) ID() string {
 func (s *Strategy) Validate() error {
 	if len(s.TargetWeights) == 0 {
 		return fmt.Errorf("targetWeights should not be empty")
+	}
+
+	if !s.TargetWeights.Sum().Eq(fixedpoint.One) {
+		return fmt.Errorf("the sum of targetWeights should be 1")
 	}
 
 	for currency, weight := range s.TargetWeights {
@@ -75,48 +66,35 @@ func (s *Strategy) Validate() error {
 }
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
-	for _, symbol := range s.getSymbols() {
-		session.Subscribe(types.KLineChannel, symbol, types.SubscribeOptions{Interval: s.Interval})
-	}
+	session.Subscribe(types.KLineChannel, s.symbols()[0], types.SubscribeOptions{Interval: s.Interval})
 }
 
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
-	s.activeOrderBooks = make(map[string]*bbgo.LocalActiveOrderBook)
-	for _, symbol := range s.getSymbols() {
-		activeOrderBook := bbgo.NewLocalActiveOrderBook(symbol)
-		activeOrderBook.BindStream(session.UserDataStream)
-		s.activeOrderBooks[symbol] = activeOrderBook
+	s.activeOrderBook = bbgo.NewActiveOrderBook("")
+	s.activeOrderBook.BindStream(session.UserDataStream)
+
+	markets := session.Markets()
+	for _, symbol := range s.symbols() {
+		if _, ok := markets[symbol]; !ok {
+			return fmt.Errorf("exchange: %s does not supoort matket: %s", session.Exchange.Name(), symbol)
+		}
 	}
 
 	session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {
-		if kline.Symbol != s.currencies[0]+s.BaseCurrency {
-			return
-		}
 		s.rebalance(ctx, orderExecutor, session)
 	})
+
 	return nil
 }
 
 func (s *Strategy) rebalance(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) {
-	for symbol, book := range s.activeOrderBooks {
-		err := orderExecutor.CancelOrders(ctx, book.Orders()...)
-		if err != nil {
-			log.WithError(err).Errorf("failed to cancel %s orders", symbol)
-			return
-		}
+	// cancel active orders before rebalance
+	if err := session.Exchange.CancelOrders(ctx, s.activeOrderBook.Orders()...); err != nil {
+		log.WithError(err).Errorf("failed to cancel orders")
 	}
 
-	prices, err := s.getPrices(ctx, session)
-	if err != nil {
-		return
-	}
-
-	balances := session.GetAccount().Balances()
-	quantities := s.getQuantities(balances)
-	marketValues := prices.Mul(quantities)
-
-	orders := s.generateSubmitOrders(prices, marketValues)
-	for _, order := range orders {
+	submitOrders := s.generateSubmitOrders(ctx, session)
+	for _, order := range submitOrders {
 		log.Infof("generated submit order: %s", order.String())
 	}
 
@@ -124,63 +102,59 @@ func (s *Strategy) rebalance(ctx context.Context, orderExecutor bbgo.OrderExecut
 		return
 	}
 
-	createdOrders, err := orderExecutor.SubmitOrders(ctx, orders...)
+	createdOrders, err := orderExecutor.SubmitOrders(ctx, submitOrders...)
 	if err != nil {
-		log.WithError(err).Error("submit order error")
+		log.WithError(err).Error("failed to submit orders")
 		return
 	}
 
-	for _, createdOrder := range createdOrders {
-		s.activeOrderBooks[createdOrder.Symbol].Add(createdOrder)
-	}
+	s.activeOrderBook.Add(createdOrders...)
 }
 
-func (s *Strategy) getPrices(ctx context.Context, session *bbgo.ExchangeSession) (prices types.Float64Slice, err error) {
-	for _, currency := range s.currencies {
+func (s *Strategy) prices(ctx context.Context, session *bbgo.ExchangeSession) types.ValueMap {
+	m := make(types.ValueMap)
+
+	tickers, err := session.Exchange.QueryTickers(ctx, s.symbols()...)
+	if err != nil {
+		log.WithError(err).Error("failed to query tickers")
+		return nil
+	}
+
+	for currency := range s.TargetWeights {
 		if currency == s.BaseCurrency {
-			prices = append(prices, 1.0)
+			m[s.BaseCurrency] = fixedpoint.One
 			continue
 		}
-
-		symbol := currency + s.BaseCurrency
-		ticker, err := session.Exchange.QueryTicker(ctx, symbol)
-		if err != nil {
-			s.Notifiability.Notify("query ticker error: %s", err.Error())
-			log.WithError(err).Error("query ticker error")
-			return prices, err
-		}
-
-		prices = append(prices, ticker.Last.Float64())
+		m[currency] = tickers[currency+s.BaseCurrency].Last
 	}
-	return prices, nil
+
+	return m
 }
 
-func (s *Strategy) getQuantities(balances types.BalanceMap) (quantities types.Float64Slice) {
-	for _, currency := range s.currencies {
-		if s.IgnoreLocked {
-			quantities = append(quantities, balances[currency].Total().Float64())
-		} else {
-			quantities = append(quantities, balances[currency].Available.Float64())
-		}
+func (s *Strategy) quantities(session *bbgo.ExchangeSession) types.ValueMap {
+	m := make(types.ValueMap)
+
+	balances := session.GetAccount().Balances()
+	for currency := range s.TargetWeights {
+		m[currency] = balances[currency].Total()
 	}
-	return quantities
+
+	return m
 }
 
-func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice) (submitOrders []types.SubmitOrder) {
+func (s *Strategy) generateSubmitOrders(ctx context.Context, session *bbgo.ExchangeSession) (submitOrders []types.SubmitOrder) {
+	prices := s.prices(ctx, session)
+	marketValues := prices.Mul(s.quantities(session))
 	currentWeights := marketValues.Normalize()
-	totalValue := marketValues.Sum()
 
-	log.Infof("total value: %f", totalValue)
-
-	for i, currency := range s.currencies {
+	for currency, targetWeight := range s.TargetWeights {
 		if currency == s.BaseCurrency {
 			continue
 		}
 
 		symbol := currency + s.BaseCurrency
-		currentWeight := currentWeights[i]
-		currentPrice := prices[i]
-		targetWeight := s.TargetWeights[currency].Float64()
+		currentWeight := currentWeights[currency]
+		currentPrice := prices[currency]
 
 		log.Infof("%s price: %v, current weight: %v, target weight: %v",
 			symbol,
@@ -190,8 +164,8 @@ func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice)
 
 		// calculate the difference between current weight and target weight
 		// if the difference is less than threshold, then we will not create the order
-		weightDifference := targetWeight - currentWeight
-		if math.Abs(weightDifference) < s.Threshold.Float64() {
+		weightDifference := targetWeight.Sub(currentWeight)
+		if weightDifference.Abs().Compare(s.Threshold) < 0 {
 			log.Infof("%s weight distance |%v - %v| = |%v| less than the threshold: %v",
 				symbol,
 				currentWeight,
@@ -201,7 +175,7 @@ func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice)
 			continue
 		}
 
-		quantity := fixedpoint.NewFromFloat((weightDifference * totalValue) / currentPrice)
+		quantity := weightDifference.Mul(marketValues.Sum()).Div(currentPrice)
 
 		side := types.SideTypeBuy
 		if quantity.Sign() < 0 {
@@ -210,7 +184,7 @@ func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice)
 		}
 
 		if s.MaxAmount.Sign() > 0 {
-			quantity = bbgo.AdjustQuantityByMaxAmount(quantity, fixedpoint.NewFromFloat(currentPrice), s.MaxAmount)
+			quantity = bbgo.AdjustQuantityByMaxAmount(quantity, currentPrice, s.MaxAmount)
 			log.Infof("adjust the quantity %v (%s %s @ %v) by max amount %v",
 				quantity,
 				symbol,
@@ -218,22 +192,25 @@ func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice)
 				currentPrice,
 				s.MaxAmount)
 		}
+
 		log.Debugf("symbol: %v, quantity: %v", symbol, quantity)
+
 		order := types.SubmitOrder{
 			Symbol:   symbol,
 			Side:     side,
 			Type:     types.OrderTypeLimit,
 			Quantity: quantity,
-			Price:    fixedpoint.NewFromFloat(currentPrice),
+			Price:    currentPrice,
 		}
 
 		submitOrders = append(submitOrders, order)
 	}
+
 	return submitOrders
 }
 
-func (s *Strategy) getSymbols() (symbols []string) {
-	for _, currency := range s.currencies {
+func (s *Strategy) symbols() (symbols []string) {
+	for currency := range s.TargetWeights {
 		if currency == s.BaseCurrency {
 			continue
 		}

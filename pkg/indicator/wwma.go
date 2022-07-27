@@ -1,8 +1,9 @@
 package indicator
 
 import (
-	"github.com/c9s/bbgo/pkg/types"
 	"time"
+
+	"github.com/c9s/bbgo/pkg/types"
 )
 
 // Refer: Welles Wilder's Moving Average
@@ -14,6 +15,7 @@ const MaxNumOfWWMATruncateSize = 100
 
 //go:generate callbackgen -type WWMA
 type WWMA struct {
+	types.SeriesBase
 	types.IntervalWindow
 	Values       types.Float64Slice
 	LastOpenTime time.Time
@@ -23,6 +25,7 @@ type WWMA struct {
 
 func (inc *WWMA) Update(value float64) {
 	if len(inc.Values) == 0 {
+		inc.SeriesBase.Series = inc
 		inc.Values.Push(value)
 		return
 	} else if len(inc.Values) > MaxNumOfWWMA {
@@ -54,7 +57,11 @@ func (inc *WWMA) Length() int {
 	return len(inc.Values)
 }
 
-func (inc *WWMA) calculateAndUpdate(allKLines []types.KLine) {
+func (inc *WWMA) PushK(k types.KLine) {
+	inc.Update(k.Close.Float64())
+}
+
+func (inc *WWMA) CalculateAndUpdate(allKLines []types.KLine) {
 	if len(allKLines) < inc.Window {
 		// we can't calculate
 		return
@@ -66,7 +73,7 @@ func (inc *WWMA) calculateAndUpdate(allKLines []types.KLine) {
 			doable = true
 		}
 		if doable {
-			inc.Update(k.Close.Float64())
+			inc.PushK(k)
 			inc.LastOpenTime = k.StartTime.Time()
 			inc.EmitUpdate(inc.Last())
 		}
@@ -78,11 +85,11 @@ func (inc *WWMA) handleKLineWindowUpdate(interval types.Interval, window types.K
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *WWMA) Bind(updater KLineWindowUpdater) {
 	updater.OnKLineWindowUpdate(inc.handleKLineWindowUpdate)
 }
 
-var _ types.Series = &WWMA{}
+var _ types.SeriesExtend = &WWMA{}

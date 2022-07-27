@@ -7,14 +7,23 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/c9s/bbgo/pkg/dynamic"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/service"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
+type TestStructWithoutInstanceID struct {
+	Symbol string
+}
+
+func (s *TestStructWithoutInstanceID) ID() string {
+	return "test-struct-no-instance-id"
+}
+
+
 type TestStruct struct {
 	*Environment
-	*Graceful
 
 	Position *types.Position `persistence:"position"`
 	Integer  int64           `persistence:"integer"`
@@ -48,8 +57,16 @@ func preparePersistentServices() []service.PersistenceService {
 }
 
 func Test_callID(t *testing.T) {
-	id := callID(&TestStruct{})
-	assert.NotEmpty(t, id)
+	t.Run("default", func(t *testing.T) {
+		id := callID(&TestStruct{})
+		assert.NotEmpty(t, id)
+		assert.Equal(t, "test-struct", id)
+	})
+
+	t.Run("fallback", func(t *testing.T) {
+		id := callID(&TestStructWithoutInstanceID{Symbol: "BTCUSDT"})
+		assert.Equal(t, "test-struct-no-instance-id:BTCUSDT", id)
+	})
 }
 
 func Test_loadPersistenceFields(t *testing.T) {
@@ -66,7 +83,7 @@ func Test_loadPersistenceFields(t *testing.T) {
 		t.Run(psName+"/nil", func(t *testing.T) {
 			var b *TestStruct = nil
 			err := loadPersistenceFields(b, "test-nil", ps)
-			assert.Equal(t, errCanNotIterateNilPointer, err)
+			assert.Equal(t, dynamic.ErrCanNotIterateNilPointer, err)
 		})
 
 		t.Run(psName+"/pointer-field", func(t *testing.T) {

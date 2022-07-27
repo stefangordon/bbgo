@@ -14,6 +14,7 @@ https://www.investopedia.com/terms/r/rsi.asp
 */
 //go:generate callbackgen -type RSI
 type RSI struct {
+	types.SeriesBase
 	types.IntervalWindow
 	Values          types.Float64Slice
 	Prices          types.Float64Slice
@@ -21,10 +22,13 @@ type RSI struct {
 	PreviousAvgGain float64
 
 	EndTime         time.Time
-	UpdateCallbacks []func(value float64)
+	updateCallbacks []func(value float64)
 }
 
 func (inc *RSI) Update(price float64) {
+	if len(inc.Prices) == 0 {
+		inc.SeriesBase.Series = inc
+	}
 	inc.Prices.Push(price)
 
 	if len(inc.Prices) < inc.Window+1 {
@@ -74,14 +78,19 @@ func (inc *RSI) Length() int {
 	return len(inc.Values)
 }
 
-var _ types.Series = &RSI{}
+var _ types.SeriesExtend = &RSI{}
 
-func (inc *RSI) calculateAndUpdate(kLines []types.KLine) {
+func (inc *RSI) PushK(k types.KLine) {
+	inc.Update(k.Close.Float64())
+}
+
+func (inc *RSI) CalculateAndUpdate(kLines []types.KLine) {
 	for _, k := range kLines {
 		if inc.EndTime != zeroTime && !k.EndTime.After(inc.EndTime) {
 			continue
 		}
-		inc.Update(k.Close.Float64())
+
+		inc.PushK(k)
 	}
 
 	inc.EmitUpdate(inc.Last())
@@ -93,7 +102,7 @@ func (inc *RSI) handleKLineWindowUpdate(interval types.Interval, window types.KL
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *RSI) Bind(updater KLineWindowUpdater) {

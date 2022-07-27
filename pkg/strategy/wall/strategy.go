@@ -30,8 +30,6 @@ func init() {
 }
 
 type Strategy struct {
-	*bbgo.Graceful
-	*bbgo.Notifiability
 	*bbgo.Persistence
 
 	Environment          *bbgo.Environment
@@ -67,8 +65,8 @@ type Strategy struct {
 	Position    *types.Position    `json:"position,omitempty" persistence:"position"`
 	ProfitStats *types.ProfitStats `json:"profitStats,omitempty" persistence:"profit_stats"`
 
-	activeAdjustmentOrders *bbgo.LocalActiveOrderBook
-	activeWallOrders       *bbgo.LocalActiveOrderBook
+	activeAdjustmentOrders *bbgo.ActiveOrderBook
+	activeWallOrders       *bbgo.ActiveOrderBook
 	orderStore             *bbgo.OrderStore
 	tradeCollector         *bbgo.TradeCollector
 
@@ -271,10 +269,10 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	s.stopC = make(chan struct{})
 
-	s.activeWallOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	s.activeWallOrders = bbgo.NewActiveOrderBook(s.Symbol)
 	s.activeWallOrders.BindStream(session.UserDataStream)
 
-	s.activeAdjustmentOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	s.activeAdjustmentOrders = bbgo.NewActiveOrderBook(s.Symbol)
 	s.activeAdjustmentOrders.BindStream(session.UserDataStream)
 
 	s.orderStore = bbgo.NewOrderStore(s.Symbol)
@@ -283,7 +281,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	s.tradeCollector = bbgo.NewTradeCollector(s.Symbol, s.Position, s.orderStore)
 
 	s.tradeCollector.OnTrade(func(trade types.Trade, profit, netProfit fixedpoint.Value) {
-		s.Notifiability.Notify(trade)
+		bbgo.Notify(trade)
 		s.ProfitStats.AddTrade(trade)
 
 		if profit.Compare(fixedpoint.Zero) == 0 {
@@ -293,10 +291,10 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			p := s.Position.NewProfit(trade, profit, netProfit)
 			p.Strategy = ID
 			p.StrategyInstanceID = instanceID
-			s.Notify(&p)
+			bbgo.Notify(&p)
 
 			s.ProfitStats.AddProfit(p)
-			s.Notify(&s.ProfitStats)
+			bbgo.Notify(&s.ProfitStats)
 
 			s.Environment.RecordPosition(s.Position, trade, &p)
 		}
@@ -304,7 +302,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	s.tradeCollector.OnPositionUpdate(func(position *types.Position) {
 		log.Infof("position changed: %s", s.Position)
-		s.Notify(s.Position)
+		bbgo.Notify(s.Position)
 	})
 
 	s.tradeCollector.BindStream(session.UserDataStream)
@@ -339,7 +337,6 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		if err := s.placeWallOrders(ctx, orderExecutor); err != nil {
 			log.WithError(err).Errorf("can not place order")
 		}
-
 
 		if err := s.activeAdjustmentOrders.GracefulCancel(ctx, s.session.Exchange); err != nil {
 			log.WithError(err).Errorf("graceful cancel order error")
@@ -379,7 +376,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		}
 	}()
 
-	s.Graceful.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
+	bbgo.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
 		defer wg.Done()
 		close(s.stopC)
 

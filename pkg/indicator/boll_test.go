@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
-	"github.com/stretchr/testify/assert"
 )
 
 /*
@@ -59,9 +60,9 @@ func TestBOLL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			boll := BOLL{IntervalWindow: types.IntervalWindow{Window: tt.window}, K: tt.k}
-			boll.calculateAndUpdate(tt.kLines)
-			assert.InDelta(t, tt.up, boll.LastUpBand(), Delta)
-			assert.InDelta(t, tt.down, boll.LastDownBand(), Delta)
+			boll.CalculateAndUpdate(tt.kLines)
+			assert.InDelta(t, tt.up, boll.UpBand.Last(), Delta)
+			assert.InDelta(t, tt.down, boll.DownBand.Last(), Delta)
 		})
 	}
 

@@ -3,8 +3,6 @@ package indicator
 import (
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -20,11 +18,16 @@ Volume Weighted Moving Average
 */
 //go:generate callbackgen -type VWMA
 type VWMA struct {
+	types.SeriesBase
 	types.IntervalWindow
-	Values  types.Float64Slice
+
+	Values         types.Float64Slice
+	PriceVolumeSMA *SMA
+	VolumeSMA      *SMA
+
 	EndTime time.Time
 
-	UpdateCallbacks []func(value float64)
+	updateCallbacks []func(value float64)
 }
 
 func (inc *VWMA) Last() float64 {
@@ -46,51 +49,48 @@ func (inc *VWMA) Length() int {
 	return len(inc.Values)
 }
 
-var _ types.Series = &VWMA{}
+var _ types.SeriesExtend = &VWMA{}
 
-func KLinePriceVolumeMapper(k types.KLine) float64 {
-	return k.Close.Mul(k.Volume).Float64()
-}
-
-func KLineVolumeMapper(k types.KLine) float64 {
-	return k.Volume.Float64()
-}
-
-func (inc *VWMA) calculateAndUpdate(kLines []types.KLine) {
-	if len(kLines) < inc.Window {
-		return
+func (inc *VWMA) Update(price, volume float64) {
+	if inc.PriceVolumeSMA == nil {
+		inc.PriceVolumeSMA = &SMA{IntervalWindow: inc.IntervalWindow}
+		inc.SeriesBase.Series = inc
 	}
 
-	var index = len(kLines) - 1
-	var kline = kLines[index]
-
-	if inc.EndTime != zeroTime && kline.EndTime.Before(inc.EndTime) {
-		return
+	if inc.VolumeSMA == nil {
+		inc.VolumeSMA = &SMA{IntervalWindow: inc.IntervalWindow}
 	}
 
-	var recentK = kLines[index-(inc.Window-1) : index+1]
+	inc.PriceVolumeSMA.Update(price * volume)
+	inc.VolumeSMA.Update(volume)
 
-	pv, err := calculateSMA(recentK, inc.Window, KLinePriceVolumeMapper)
-	if err != nil {
-		log.WithError(err).Error("price x volume SMA error")
-		return
-	}
-	v, err := calculateSMA(recentK, inc.Window, KLineVolumeMapper)
-	if err != nil {
-		log.WithError(err).Error("volume SMA error")
-		return
-	}
-
+	pv := inc.PriceVolumeSMA.Last()
+	v := inc.VolumeSMA.Last()
 	vwma := pv / v
 	inc.Values.Push(vwma)
+}
 
-	if len(inc.Values) > MaxNumOfSMA {
-		inc.Values = inc.Values[MaxNumOfSMATruncateSize-1:]
+func (inc *VWMA) CalculateAndUpdate(allKLines []types.KLine) {
+	if len(allKLines) < inc.Window {
+		return
 	}
 
-	inc.EndTime = kLines[index].EndTime.Time()
+	var last = allKLines[len(allKLines)-1]
 
-	inc.EmitUpdate(vwma)
+	if inc.VolumeSMA == nil {
+		for _, k := range allKLines {
+			if inc.EndTime != zeroTime && k.EndTime.Before(inc.EndTime) {
+				return
+			}
+
+			inc.Update(k.Close.Float64(), k.Volume.Float64())
+		}
+	} else {
+		inc.Update(last.Close.Float64(), last.Volume.Float64())
+	}
+
+	inc.EndTime = last.EndTime.Time()
+	inc.EmitUpdate(inc.Values.Last())
 }
 
 func (inc *VWMA) handleKLineWindowUpdate(interval types.Interval, window types.KLineWindow) {
@@ -98,7 +98,7 @@ func (inc *VWMA) handleKLineWindowUpdate(interval types.Interval, window types.K
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *VWMA) Bind(updater KLineWindowUpdater) {

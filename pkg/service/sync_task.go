@@ -37,14 +37,24 @@ type SyncTask struct {
 	// Filter is an optional field, which is used for filtering the remote records
 	Filter func(obj interface{}) bool
 
+	// BatchQuery is used for querying remote records.
+	BatchQuery func(ctx context.Context, startTime, endTime time.Time) (interface{}, chan error)
+
 	// Insert is an option field, which is used for customizing the record insert
 	Insert func(obj interface{}) error
 
-	// BatchQuery is used for querying remote records.
-	BatchQuery func(ctx context.Context, startTime, endTime time.Time) (interface{}, chan error)
+	// Insert is an option field, which is used for customizing the record batch insert
+	BatchInsert func(obj interface{}) error
+
+	BatchInsertBuffer int
+
+	// LogInsert logs the insert record in INFO level
+	LogInsert bool
 }
 
 func (sel SyncTask) execute(ctx context.Context, db *sqlx.DB, startTime time.Time, args ...time.Time) error {
+	batchBufferRefVal := reflect.MakeSlice(reflect.SliceOf(reflect.TypeOf(sel.Type)), 0, sel.BatchInsertBuffer)
+
 	// query from db
 	recordSlice, err := selectAndScanType(ctx, db, sel.Select, sel.Type)
 	if err != nil {
@@ -60,7 +70,7 @@ func (sel SyncTask) execute(ctx context.Context, db *sqlx.DB, startTime time.Tim
 
 	ids := buildIdMap(sel, recordSliceRef)
 
-	if err := sortRecords(sel, recordSliceRef); err != nil {
+	if err := sortRecordsAscending(sel, recordSliceRef); err != nil {
 		return err
 	}
 
@@ -80,14 +90,20 @@ func (sel SyncTask) execute(ctx context.Context, db *sqlx.DB, startTime time.Tim
 	dataC, errC := sel.BatchQuery(ctx, startTime, endTime)
 	dataCRef := reflect.ValueOf(dataC)
 
+	defer func() {
+		if sel.BatchInsert != nil && batchBufferRefVal.Len() > 0 {
+			slice := batchBufferRefVal.Interface()
+			if err := sel.BatchInsert(slice); err != nil {
+				logrus.WithError(err).Errorf("batch insert error: %+v", slice)
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			logrus.Warnf("context is cancelled, stop syncing")
 			return ctx.Err()
-
-		case err := <-errC:
-			return err
 
 		default:
 			v, ok := dataCRef.Recv()
@@ -99,25 +115,56 @@ func (sel SyncTask) execute(ctx context.Context, db *sqlx.DB, startTime time.Tim
 			obj := v.Interface()
 			id := sel.ID(obj)
 			if _, exists := ids[id]; exists {
+				logrus.Debugf("object %s already exists, skipping", id)
+				continue
+			}
+
+			tt := sel.Time(obj)
+			if tt.Before(startTime) || tt.After(endTime) {
+				logrus.Debugf("object %s time %s is outside of the time range", id, tt)
 				continue
 			}
 
 			if sel.Filter != nil {
 				if !sel.Filter(obj) {
+					logrus.Debugf("object %s is filtered", id)
 					continue
 				}
 			}
 
-			logrus.Infof("inserting %T: %+v", obj, obj)
+			ids[id] = struct{}{}
+			if sel.BatchInsert != nil {
+				if batchBufferRefVal.Len() > sel.BatchInsertBuffer-1 {
+					if sel.LogInsert {
+						logrus.Infof("batch inserting %d %T", batchBufferRefVal.Len(), obj)
+					} else {
+						logrus.Debugf("batch inserting %d %T", batchBufferRefVal.Len(), obj)
+					}
 
-			if sel.Insert != nil {
-				// for custom insert
-				if err := sel.Insert(obj); err != nil {
-					return err
+					if err := sel.BatchInsert(batchBufferRefVal.Interface()); err != nil {
+						return err
+					}
+
+					batchBufferRefVal = reflect.MakeSlice(reflect.SliceOf(reflect.TypeOf(sel.Type)), 0, sel.BatchInsertBuffer)
 				}
+				batchBufferRefVal = reflect.Append(batchBufferRefVal, v)
 			} else {
-				if err := insertType(db, obj); err != nil {
-					return err
+				if sel.LogInsert {
+					logrus.Infof("inserting %T: %+v", obj, obj)
+				} else {
+					logrus.Debugf("inserting %T: %+v", obj, obj)
+				}
+				if sel.Insert != nil {
+					// for custom insert
+					if err := sel.Insert(obj); err != nil {
+						logrus.WithError(err).Errorf("can not insert record: %v", obj)
+						return err
+					}
+				} else {
+					if err := insertType(db, obj); err != nil {
+						logrus.WithError(err).Errorf("can not insert record: %v", obj)
+						return err
+					}
 				}
 			}
 		}
@@ -128,13 +175,14 @@ func lastRecordTime(sel SyncTask, recordSlice reflect.Value, defaultTime time.Ti
 	since := defaultTime
 	length := recordSlice.Len()
 	if length > 0 {
-		since = sel.Time(recordSlice.Index(length - 1).Interface())
+		last := recordSlice.Index(length - 1)
+		since = sel.Time(last.Interface())
 	}
 
 	return since
 }
 
-func sortRecords(sel SyncTask, recordSlice reflect.Value) error {
+func sortRecordsAscending(sel SyncTask, recordSlice reflect.Value) error {
 	if sel.Time == nil {
 		return errors.New("time field is not set, can not sort records")
 	}

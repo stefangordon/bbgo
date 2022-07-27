@@ -39,9 +39,15 @@ type SummaryReport struct {
 	InitialTotalBalances types.BalanceMap `json:"initialTotalBalances"`
 	FinalTotalBalances   types.BalanceMap `json:"finalTotalBalances"`
 
+	InitialEquityValue fixedpoint.Value `json:"initialEquityValue"`
+	FinalEquityValue   fixedpoint.Value `json:"finalEquityValue"`
+
 	// TotalProfit is the profit aggregated from the symbol reports
 	TotalProfit           fixedpoint.Value `json:"totalProfit,omitempty"`
 	TotalUnrealizedProfit fixedpoint.Value `json:"totalUnrealizedProfit,omitempty"`
+
+	TotalGrossProfit fixedpoint.Value `json:"totalGrossProfit,omitempty"`
+	TotalGrossLoss   fixedpoint.Value `json:"totalGrossLoss,omitempty"`
 
 	SymbolReports []SessionSymbolReport `json:"symbolReports,omitempty"`
 
@@ -75,13 +81,21 @@ type SessionSymbolReport struct {
 	Manifests       Manifests                 `json:"manifests,omitempty"`
 }
 
+func (r *SessionSymbolReport) InitialEquityValue() fixedpoint.Value {
+	return InQuoteAsset(r.InitialBalances, r.Market, r.StartPrice)
+}
+
+func (r *SessionSymbolReport) FinalEquityValue() fixedpoint.Value {
+	return InQuoteAsset(r.FinalBalances, r.Market, r.LastPrice)
+}
+
 func (r *SessionSymbolReport) Print(wantBaseAssetBaseline bool) {
 	color.Green("%s %s PROFIT AND LOSS REPORT", r.Exchange, r.Symbol)
 	color.Green("===============================================")
 	r.PnL.Print()
 
-	initQuoteAsset := inQuoteAsset(r.InitialBalances, r.Market, r.StartPrice)
-	finalQuoteAsset := inQuoteAsset(r.FinalBalances, r.Market, r.LastPrice)
+	initQuoteAsset := r.InitialEquityValue()
+	finalQuoteAsset := r.FinalEquityValue()
 	color.Green("INITIAL ASSET IN %s ~= %s %s (1 %s = %v)", r.Market.QuoteCurrency, r.Market.FormatQuantity(initQuoteAsset), r.Market.QuoteCurrency, r.Market.BaseCurrency, r.StartPrice)
 	color.Green("FINAL ASSET IN %s ~= %s %s (1 %s = %v)", r.Market.QuoteCurrency, r.Market.FormatQuantity(finalQuoteAsset), r.Market.QuoteCurrency, r.Market.BaseCurrency, r.LastPrice)
 
@@ -135,18 +149,89 @@ func FormatSessionName(sessions []string, symbols []string, startTime, endTime t
 }
 
 func WriteReportIndex(outputDirectory string, reportIndex *ReportIndex) error {
-	indexFile := filepath.Join(outputDirectory, "index.json")
-	if err := util.WriteJsonFile(indexFile, reportIndex); err != nil {
+	indexFile := getReportIndexPath(outputDirectory)
+	indexLock := flock.New(indexFile)
+
+	if err := indexLock.Lock(); err != nil {
+		log.WithError(err).Errorf("report index file lock error while write report: %s", err)
+		return err
+	}
+	defer func() {
+		if err := indexLock.Unlock(); err != nil {
+			log.WithError(err).Errorf("report index file unlock error while write report: %s", err)
+		}
+	}()
+
+	return writeReportIndexLocked(outputDirectory, reportIndex)
+}
+
+func LoadReportIndex(outputDirectory string) (*ReportIndex, error) {
+	indexFile := getReportIndexPath(outputDirectory)
+	indexLock := flock.New(indexFile)
+
+	if err := indexLock.Lock(); err != nil {
+		log.WithError(err).Errorf("report index file lock error while load report: %s", err)
+		return nil, err
+	}
+	defer func() {
+		if err := indexLock.Unlock(); err != nil {
+			log.WithError(err).Errorf("report index file unlock error while load report: %s", err)
+		}
+	}()
+
+	return loadReportIndexLocked(indexFile)
+}
+
+func AddReportIndexRun(outputDirectory string, run Run) error {
+	// append report index
+	indexFile := getReportIndexPath(outputDirectory)
+	indexLock := flock.New(indexFile)
+
+	if err := indexLock.Lock(); err != nil {
+		log.WithError(err).Errorf("report index file lock error: %s", err)
+		return err
+	}
+	defer func() {
+		if err := indexLock.Unlock(); err != nil {
+			log.WithError(err).Errorf("report index file unlock error: %s", err)
+		}
+	}()
+
+	reportIndex, err := loadReportIndexLocked(indexFile)
+	if err != nil {
+		return err
+	}
+
+	reportIndex.Runs = append(reportIndex.Runs, run)
+	return writeReportIndexLocked(indexFile, reportIndex)
+}
+
+// InQuoteAsset converts all balances in quote asset
+func InQuoteAsset(balances types.BalanceMap, market types.Market, price fixedpoint.Value) fixedpoint.Value {
+	quote := balances[market.QuoteCurrency]
+	base := balances[market.BaseCurrency]
+	return base.Total().Mul(price).Add(quote.Total())
+}
+
+func getReportIndexPath(outputDirectory string) string {
+	return filepath.Join(outputDirectory, "index.json")
+}
+
+// writeReportIndexLocked must be protected by file lock
+func writeReportIndexLocked(indexFilePath string, reportIndex *ReportIndex) error {
+	if err := util.WriteJsonFile(indexFilePath, reportIndex); err != nil {
 		return err
 	}
 	return nil
 }
 
-func LoadReportIndex(outputDirectory string) (*ReportIndex, error) {
+// loadReportIndexLocked must be protected by file lock
+func loadReportIndexLocked(indexFilePath string) (*ReportIndex, error) {
 	var reportIndex ReportIndex
-	indexFile := filepath.Join(outputDirectory, "index.json")
-	if _, err := os.Stat(indexFile); err == nil {
-		o, err := ioutil.ReadFile(indexFile)
+	if fileInfo, err := os.Stat(indexFilePath); err != nil {
+		return nil, err
+	} else if fileInfo.Size() != 0 {
+		o, err := ioutil.ReadFile(indexFilePath)
 		if err != nil {
 			return nil, err
 		}
@@ -157,38 +242,4 @@ func LoadReportIndex(outputDirectory string) (*ReportIndex, error) {
 	}
 
 	return &reportIndex, nil
-}
-
-func AddReportIndexRun(outputDirectory string, run Run) error {
-	// append report index
-	lockFile := filepath.Join(outputDirectory, ".report.lock")
-	fileLock := flock.New(lockFile)
-
-	err := fileLock.Lock()
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		if err := fileLock.Unlock(); err != nil {
-			log.WithError(err).Errorf("report index file lock error: %s", lockFile)
-		}
-		if err := os.Remove(lockFile); err != nil {
-			log.WithError(err).Errorf("can not remove lock file: %s", lockFile)
-		}
-	}()
-	reportIndex, err := LoadReportIndex(outputDirectory)
-	if err != nil {
-		return err
-	}
-
-	reportIndex.Runs = append(reportIndex.Runs, run)
-	return WriteReportIndex(outputDirectory, reportIndex)
-}
-
-// inQuoteAsset converts all balances in quote asset
-func inQuoteAsset(balances types.BalanceMap, market types.Market, price fixedpoint.Value) fixedpoint.Value {
-	quote := balances[market.QuoteCurrency]
-	base := balances[market.BaseCurrency]
-	return base.Total().Mul(price).Add(quote.Total())
 }

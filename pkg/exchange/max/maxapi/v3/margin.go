@@ -38,10 +38,6 @@ func (s *MarginService) NewGetMarginLoanHistoryRequest() *GetMarginLoanHistoryRe
 	return &GetMarginLoanHistoryRequest{client: s.Client}
 }
 
-func (s *MarginService) NewGetMarginADRatioRequest() *GetMarginADRatioRequest {
-	return &GetMarginADRatioRequest{client: s.Client}
-}
-
 func (s *MarginService) NewMarginRepayRequest() *MarginRepayRequest {
 	return &MarginRepayRequest{client: s.Client}
 }
@@ -161,15 +157,4 @@ type MarginRepayRequest struct {
 	client   requestgen.AuthenticatedAPIClient
 	currency string `param:"currency,slug,required"`
 	amount   string `param:"amount"`
-}
-
-type ADRatio struct {
-	AdRatio     fixedpoint.Value `json:"ad_ratio"`
-	AssetInUsdt fixedpoint.Value `json:"asset_in_usdt"`
-	DebtInUsdt  fixedpoint.Value `json:"debt_in_usdt"`
-}
-
-//go:generate GetRequest -url "/api/v3/wallet/m/ad_ratio" -type GetMarginADRatioRequest -responseType .ADRatio
-type GetMarginADRatioRequest struct {
-	client requestgen.AuthenticatedAPIClient
 }

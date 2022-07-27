@@ -2,8 +2,9 @@ package indicator
 
 import (
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/c9s/bbgo/pkg/types"
 )
@@ -20,7 +21,7 @@ type Pivot struct {
 
 	EndTime time.Time
 
-	UpdateCallbacks []func(valueLow, valueHigh float64)
+	updateCallbacks []func(valueLow, valueHigh float64)
 }
 
 func (inc *Pivot) LastLow() float64 {
@@ -37,7 +38,7 @@ func (inc *Pivot) LastHigh() float64 {
 	return inc.Highs[len(inc.Highs)-1]
 }
 
-func (inc *Pivot) calculateAndUpdate(klines []types.KLine) {
+func (inc *Pivot) CalculateAndUpdate(klines []types.KLine) {
 	if len(klines) < inc.Window {
 		return
 	}
@@ -45,19 +46,25 @@ func (inc *Pivot) calculateAndUpdate(klines []types.KLine) {
 	var end = len(klines) - 1
 	var lastKLine = klines[end]
 
+	// skip old data
 	if inc.EndTime != zeroTime && lastKLine.GetEndTime().Before(inc.EndTime) {
 		return
 	}
 
-	var recentT = klines[end-(inc.Window-1) : end+1]
+	recentT := klines[end-(inc.Window-1) : end+1]
 
 	l, h, err := calculatePivot(recentT, inc.Window, KLineLowPriceMapper, KLineHighPriceMapper)
 	if err != nil {
 		log.WithError(err).Error("can not calculate pivots")
 		return
 	}
-	inc.Lows.Push(l)
-	inc.Highs.Push(h)
+
+	if l > 0.0 {
+		inc.Lows.Push(l)
+	}
+	if h > 0.0 {
+		inc.Highs.Push(h)
+	}
 
 	if len(inc.Lows) > MaxNumOfVOL {
 		inc.Lows = inc.Lows[MaxNumOfVOLTruncateSize-1:]
@@ -77,7 +84,7 @@ func (inc *Pivot) handleKLineWindowUpdate(interval types.Interval, window types.
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *Pivot) Bind(updater KLineWindowUpdater) {
@@ -87,8 +94,9 @@ func (inc *Pivot) Bind(updater KLineWindowUpdater) {
 func calculatePivot(klines []types.KLine, window int, valLow KLineValueMapper, valHigh KLineValueMapper) (float64, float64, error) {
 	length := len(klines)
 	if length == 0 || length < window {
-		return 0., 0., fmt.Errorf("insufficient elements for calculating  with window = %d", window)
+		return 0., 0., fmt.Errorf("insufficient elements for calculating with window = %d", window)
 	}
+
 	var lows types.Float64Slice
 	var highs types.Float64Slice
 	for _, k := range klines {
@@ -100,6 +108,7 @@ func calculatePivot(klines []types.KLine, window int, valLow KLineValueMapper, v
 	if lows.Min() == lows.Index(int(window/2.)-1) {
 		pl = lows.Min()
 	}
+
 	ph := 0.
 	if highs.Max() == highs.Index(int(window/2.)-1) {
 		ph = highs.Max()

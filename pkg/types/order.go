@@ -116,9 +116,13 @@ type SubmitOrder struct {
 	Side   SideType  `json:"side" db:"side"`
 	Type   OrderType `json:"orderType" db:"order_type"`
 
-	Quantity  fixedpoint.Value `json:"quantity" db:"quantity"`
-	Price     fixedpoint.Value `json:"price" db:"price"`
-	StopPrice fixedpoint.Value `json:"stopPrice,omitempty" db:"stop_price"`
+	Quantity     fixedpoint.Value `json:"quantity" db:"quantity"`
+	Price        fixedpoint.Value `json:"price" db:"price"`
+
+	// AveragePrice is only used in back-test currently
+	AveragePrice fixedpoint.Value `json:"averagePrice"`
+
+	StopPrice    fixedpoint.Value `json:"stopPrice,omitempty" db:"stop_price"`
 
 	Market Market `json:"-" db:"-"`
 
@@ -132,9 +136,11 @@ type SubmitOrder struct {
 	IsFutures     bool `json:"is_futures" db:"is_futures"`
 	ReduceOnly    bool `json:"reduceOnly" db:"reduce_only"`
 	ClosePosition bool `json:"closePosition" db:"close_position"`
+
+	Tag string `json:"tag" db:"-"`
 }
 
-func (o SubmitOrder) String() string {
+func (o *SubmitOrder) String() string {
 	switch o.Type {
 	case OrderTypeMarket:
 		return fmt.Sprintf("SubmitOrder %s %s %s %s", o.Symbol, o.Type, o.Side, o.Quantity.String())
@@ -143,7 +149,7 @@ func (o SubmitOrder) String() string {
 	return fmt.Sprintf("SubmitOrder %s %s %s %s @ %s", o.Symbol, o.Type, o.Side, o.Quantity.String(), o.Price.String())
 }
 
-func (o SubmitOrder) PlainText() string {
+func (o *SubmitOrder) PlainText() string {
 	switch o.Type {
 	case OrderTypeMarket:
 		return fmt.Sprintf("SubmitOrder %s %s %s %s", o.Symbol, o.Type, o.Side, o.Quantity.String())
@@ -152,7 +158,7 @@ func (o SubmitOrder) PlainText() string {
 	return fmt.Sprintf("SubmitOrder %s %s %s %s @ %s", o.Symbol, o.Type, o.Side, o.Quantity.String(), o.Price.String())
 }
 
-func (o SubmitOrder) SlackAttachment() slack.Attachment {
+func (o *SubmitOrder) SlackAttachment() slack.Attachment {
 	var fields = []slack.AttachmentField{
 		{Title: "Symbol", Value: o.Symbol, Short: true},
 		{Title: "Side", Value: string(o.Side), Short: true},
@@ -229,6 +235,7 @@ func (o Order) CsvHeader() []string {
 		"quantity",
 		"creation_time",
 		"update_time",
+		"tag",
 	}
 }
 
@@ -242,8 +249,9 @@ func (o Order) CsvRecords() [][]string {
 			string(o.Status),
 			o.Price.String(),
 			o.Quantity.String(),
-			o.CreationTime.Time().UTC().Format(time.RFC1123),
-			o.UpdateTime.Time().UTC().Format(time.RFC1123),
+			o.CreationTime.Time().Format(time.RFC1123),
+			o.UpdateTime.Time().Format(time.RFC1123),
+			o.Tag,
 		},
 	}
 }
@@ -267,16 +275,22 @@ func (o Order) String() string {
 		orderID = strconv.FormatUint(o.OrderID, 10)
 	}
 
-	return fmt.Sprintf("ORDER %s | %s | %s | %s %-4s | %s/%s @ %s | %s",
+	desc := fmt.Sprintf("ORDER %s | %s | %s | %s | %s %-4s | %s/%s @ %s",
 		o.Exchange.String(),
 		o.CreationTime.Time().Local().Format(time.RFC1123),
 		orderID,
 		o.Symbol,
+		o.Type,
 		o.Side,
 		o.ExecutedQuantity.String(),
 		o.Quantity.String(),
-		o.Price.String(),
-		o.Status)
+		o.Price.String())
+
+	if o.Type == OrderTypeStopLimit {
+		desc += " Stop @ " + o.StopPrice.String()
+	}
+
+	return desc + " | " + string(o.Status)
 }
 
 // PlainText is used for telegram-styled messages

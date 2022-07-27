@@ -50,35 +50,34 @@ function StatsGridIcons({data}: StatsGridIconsProps) {
     const DiffIcon = stat.diff && stat.diff > 0 ? ArrowUpRight : ArrowDownRight;
     const DirIcon = stat.dir && stat.dir == "up" ? ArrowUpRight : ArrowDownRight;
 
-    return (
+  return (
       <Paper withBorder p="xs" radius="md" key={stat.title}>
-        <Group position="apart">
+        <Group position="left">
           <div>
             <Text
               color="dimmed"
-              transform="uppercase"
               weight={700}
               size="xs"
               className={classes.label}
             >
               {stat.title}
+              {stat.dir ?
+                <ThemeIcon
+                  color="gray"
+                  variant="light"
+                  sx={(theme) => ({color: stat.dir == "up" ? theme.colors.teal[6] : theme.colors.red[6]})}
+                  size={16}
+                  radius="xs"
+                >
+                  <DirIcon size={16}/>
+                </ThemeIcon>
+                : null}
             </Text>
-            <Text weight={700} size="xl">
+            <Text weight={700} size="xs">
               {stat.value}
             </Text>
           </div>
 
-          {stat.dir ?
-            <ThemeIcon
-              color="gray"
-              variant="light"
-              sx={(theme) => ({color: stat.dir == "up" ? theme.colors.teal[6] : theme.colors.red[6]})}
-              size={38}
-              radius="md"
-            >
-              <DirIcon size={28}/>
-            </ThemeIcon>
-            : null}
 
           {stat.diff ?
             <ThemeIcon
@@ -112,11 +111,9 @@ function StatsGridIcons({data}: StatsGridIconsProps) {
   });
 
   return (
-    <div className={classes.root}>
-      <SimpleGrid cols={4} breakpoints={[{maxWidth: 'sm', cols: 1}]}>
+      <SimpleGrid cols={5} breakpoints={[{maxWidth: 'sm', cols: 1, spacing: 'xl'}]} py="xl">
         {stats}
       </SimpleGrid>
-    </div>
   );
 }
 
@@ -151,7 +148,7 @@ const BalanceDetails = (props: BalanceDetailsProps) => {
     </tr>;
   });
 
-  return <Table>
+  return <Table verticalSpacing="xs" fontSize="xs">
     <thead>
     <tr>
       <th>Currency</th>
@@ -177,6 +174,8 @@ const ReportDetails = (props: ReportDetailsProps) => {
     </div>;
   }
 
+  const strategyName = props.runID.split("_")[1]
+  const runID = props.runID.split("_").pop()
   const totalProfit = Math.round(reportSummary.symbolReports.map((report) => report.pnl.profit).reduce((prev, cur) => prev + cur) * 100) / 100
   const totalUnrealizedProfit = Math.round(reportSummary.symbolReports.map((report) => report.pnl.unrealizedProfit).reduce((prev, cur) => prev + cur) * 100) / 100
   const totalTrades = reportSummary.symbolReports.map((report) => report.pnl.numTrades).reduce((prev, cur) => prev + cur) || 0
@@ -186,37 +185,39 @@ const ReportDetails = (props: ReportDetailsProps) => {
 
   const volumeUnit = reportSummary.symbolReports.length == 1 ? reportSummary.symbolReports[0].market.baseCurrency : '';
 
-  return <div>
-    <Container my="md" mx="xs">
-      <Title order={2}>RUN {props.runID}</Title>
-      <div>
-        {reportSummary.sessions.map((session) => <Badge key={session}>Exchange {session}</Badge>)}
-        {reportSummary.symbols.map((symbol) => <Badge key={symbol}>{symbol}</Badge>)}
 
-        <Badge>{reportSummary.startTime.toString()} ~ {reportSummary.endTime.toString()}</Badge>
-        <Badge>{
+
+  // size xl and padding xs
+  return <Container size={"xl"} px="xs">
+      <div>
+        <Badge key={strategyName} color="teal">Strategy: {strategyName}</Badge>
+        {reportSummary.sessions.map((session) => <Badge key={session} color="teal">Exchange: {session}</Badge>)}
+        {reportSummary.symbols.map((symbol) => <Badge key={symbol} color="teal">Symbol: {symbol}</Badge>)}
+
+        <Badge color="teal">{reportSummary.startTime.toString()} — {reportSummary.endTime.toString()} ~ {
           moment.duration((new Date(reportSummary.endTime)).getTime() - (new Date(reportSummary.startTime)).getTime()).humanize()
         }</Badge>
+        <Badge key={runID} color="gray" size="xs">Run ID: {runID}</Badge>
       </div>
       <StatsGridIcons data={[
-        {title: "Profit", value: "$" + totalProfit.toString(), dir: totalProfit > 0 ? "up" : "down"},
+        {title: "Profit", value: "$" + totalProfit.toString(), dir: totalProfit >= 0 ? "up" : "down"},
         {
-          title: "Unrealized Profit",
-          value: "$" + totalUnrealizedProfit.toString(),
+          title: "Unr. Profit",
+          value: totalUnrealizedProfit.toString() + "$",
           dir: totalUnrealizedProfit > 0 ? "up" : "down"
         },
         {title: "Trades", value: totalTrades.toString()},
-        {title: "Buy Volume", value: totalBuyVolume.toString() + ` ${volumeUnit}`},
-        {title: "Sell Volume", value: totalSellVolume.toString() + ` ${volumeUnit}`},
+        {title: "Buy Vol", value: totalBuyVolume.toString() + ` ${volumeUnit}`},
+        {title: "Sell Vol", value: totalSellVolume.toString() + ` ${volumeUnit}`},
       ]}/>
 
-      <Grid p={"xs"} mb={"lg"}>
+      <Grid py="xl">
         <Grid.Col xs={6}>
-          <Title order={5}>Initial Total Balances</Title>
+          <Title order={6}>Initial Total Balances</Title>
           <BalanceDetails balances={reportSummary.initialTotalBalances}/>
         </Grid.Col>
         <Grid.Col xs={6}>
-          <Title order={5}>Final Total Balances</Title>
+          <Title order={6}>Final Total Balances</Title>
           <BalanceDetails balances={reportSummary.finalTotalBalances}/>
         </Grid.Col>
       </Grid>
@@ -240,8 +241,8 @@ const ReportDetails = (props: ReportDetailsProps) => {
         }
       </div>
 
-    </Container>
-  </div>;
+    </Container>;
 };
+
 
 export default ReportDetails;

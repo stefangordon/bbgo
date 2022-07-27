@@ -44,7 +44,8 @@ func NewStream(key, secret string) *Stream {
 	stream := &Stream{
 		StandardStream: types.NewStandardStream(),
 		key:            key,
-		secret:         secret,
+		// pragma: allowlist nextline secret
+		secret: secret,
 	}
 	stream.SetEndpointCreator(stream.getEndpoint)
 	stream.SetParser(max.ParseMessage)
@@ -116,7 +117,9 @@ func (s *Stream) handleConnect() {
 
 		nonce := time.Now().UnixNano() / int64(time.Millisecond)
 		auth := &max.AuthMessage{
-			Action:    "auth",
+			// pragma: allowlist nextline secret
+			Action: "auth",
+			// pragma: allowlist nextline secret
 			APIKey:    s.key,
 			Nonce:     nonce,
 			Signature: signPayload(fmt.Sprintf("%d", nonce), s.secret),
@@ -259,10 +262,10 @@ func (s *Stream) dispatchEvent(e interface{}) {
 		s.EmitOrderUpdateEvent(*e)
 
 	case *max.ADRatioEvent:
-		log.Infof("adRatio: %+v", e.ADRatio)
+		s.EmitAdRatioEvent(*e)
 
 	case *max.DebtEvent:
-		log.Infof("debtEvent: %+v", e.Debts)
+		s.EmitDebtEvent(*e)
 
 	default:
 		log.Warnf("unhandled %T event: %+v", e, e)

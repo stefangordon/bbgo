@@ -1,10 +1,10 @@
 package fixedpoint
 
 import (
+	"encoding/json"
+	"github.com/stretchr/testify/assert"
 	"math/big"
 	"testing"
-	"github.com/stretchr/testify/assert"
-	"encoding/json"
 )
 
 const Delta = 1e-9
@@ -16,7 +16,7 @@ func BenchmarkMul(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			x := NewFromFloat(20.0)
 			y := NewFromFloat(20.0)
-			x = x.Mul(y)
+			x = x.Mul(y) // nolint
 		}
 	})
 
@@ -24,7 +24,7 @@ func BenchmarkMul(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			x := NewFromFloat(88.12345678)
 			y := NewFromFloat(88.12345678)
-			x = x.Mul(y)
+			x = x.Mul(y) // nolint
 		}
 	})
 
@@ -32,7 +32,7 @@ func BenchmarkMul(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			x := big.NewFloat(20.0)
 			y := big.NewFloat(20.0)
-			x = new(big.Float).Mul(x, y)
+			x = new(big.Float).Mul(x, y) // nolint
 		}
 	})
 
@@ -40,7 +40,7 @@ func BenchmarkMul(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			x := big.NewFloat(88.12345678)
 			y := big.NewFloat(88.12345678)
-			x = new(big.Float).Mul(x, y)
+			x = new(big.Float).Mul(x, y) // nolint
 		}
 	})
 }
@@ -69,6 +69,15 @@ func TestNew(t *testing.T) {
 	assert.Equal(t, "0.0010", f.FormatString(4))
 	assert.Equal(t, "0.1%", f.Percentage())
 	assert.Equal(t, "0.10%", f.FormatPercentage(2))
+	f = NewFromFloat(0.1)
+	assert.Equal(t, "10%", f.Percentage())
+	assert.Equal(t, "10%", f.FormatPercentage(0))
+	f = NewFromFloat(0.01)
+	assert.Equal(t, "1%", f.Percentage())
+	assert.Equal(t, "1%", f.FormatPercentage(0))
+	f = NewFromFloat(0.111)
+	assert.Equal(t, "11.1%", f.Percentage())
+	assert.Equal(t, "11.1%", f.FormatPercentage(1))
 }
 
 func TestFormatString(t *testing.T) {
@@ -158,12 +167,10 @@ func TestJson(t *testing.T) {
 	assert.Equal(t, "0.00000000", p.FormatString(8))
 	assert.Equal(t, "0.00000000", string(e))
 
-
 	_ = json.Unmarshal([]byte("0.00153917575"), &p)
 	assert.Equal(t, "0.00153917", p.FormatString(8))
 
-	var q Value
-	q = NewFromFloat(0.00153917575)
+	q := NewFromFloat(0.00153917575)
 	assert.Equal(t, p, q)
 	_ = json.Unmarshal([]byte("6e-8"), &p)
 	_ = json.Unmarshal([]byte("0.000062"), &q)

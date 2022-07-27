@@ -3,13 +3,15 @@ package fmaker
 import (
 	"context"
 	"fmt"
-	"github.com/c9s/bbgo/pkg/bbgo"
-	"github.com/c9s/bbgo/pkg/fixedpoint"
-	"github.com/c9s/bbgo/pkg/types"
+	"math"
+
 	"github.com/sajari/regression"
 	"github.com/sirupsen/logrus"
 	"gonum.org/v1/gonum/floats"
-	"math"
+
+	"github.com/c9s/bbgo/pkg/bbgo"
+	"github.com/c9s/bbgo/pkg/fixedpoint"
+	"github.com/c9s/bbgo/pkg/types"
 )
 
 const ID = "fmaker"
@@ -29,8 +31,6 @@ type IntervalWindowSetting struct {
 }
 
 type Strategy struct {
-	*bbgo.Graceful
-	*bbgo.Notifiability
 	*bbgo.Persistence
 
 	Environment *bbgo.Environment
@@ -45,8 +45,9 @@ type Strategy struct {
 
 	Spread fixedpoint.Value `json:"spread" persistence:"spread"`
 
-	activeMakerOrders *bbgo.LocalActiveOrderBook
-	//closePositionOrders *bbgo.LocalActiveOrderBook
+	activeMakerOrders *bbgo.ActiveOrderBook
+	// closePositionOrders *bbgo.LocalActiveOrderBook
+
 	orderStore     *bbgo.OrderStore
 	tradeCollector *bbgo.TradeCollector
 
@@ -99,7 +100,7 @@ func (s *Strategy) placeOrder(ctx context.Context, price fixedpoint.Value, qty f
 	}
 	s.orderStore.Add(createdOrders...)
 	s.activeMakerOrders.Add(createdOrders...)
-	//s.tradeCollector.Process()
+	// s.tradeCollector.Process()
 }
 
 func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Value) error {
@@ -124,11 +125,11 @@ func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Valu
 		Side:     side,
 		Type:     types.OrderTypeMarket,
 		Quantity: quantity,
-		//Price:    closePrice,
+		// Price:    closePrice,
 		Market: s.Market,
 	}
 
-	//s.Notify("Submitting %s %s order to close position by %v", s.Symbol, side.String(), percentage, submitOrder)
+	// s.Notify("Submitting %s %s order to close position by %v", s.Symbol, side.String(), percentage, submitOrder)
 
 	createdOrders, err := s.session.Exchange.SubmitOrders(ctx, submitOrder)
 	if err != nil {
@@ -146,16 +147,16 @@ func (s *Strategy) InstanceID() string {
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
 	// initial required information
 	s.session = session
-	//s.prevClose = fixedpoint.Zero
+	// s.prevClose = fixedpoint.Zero
 
 	// first we need to get market data store(cached market data) from the exchange session
-	//st, _ := session.MarketDataStore(s.Symbol)
+	// st, _ := session.MarketDataStore(s.Symbol)
 
-	s.activeMakerOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	s.activeMakerOrders = bbgo.NewActiveOrderBook(s.Symbol)
 	s.activeMakerOrders.BindStream(session.UserDataStream)
 
-	//s.closePositionOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
-	//s.closePositionOrders.BindStream(session.UserDataStream)
+	// s.closePositionOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	// s.closePositionOrders.BindStream(session.UserDataStream)
 
 	s.orderStore = bbgo.NewOrderStore(s.Symbol)
 	s.orderStore.BindStream(session.UserDataStream)
@@ -166,7 +167,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	// calculate group id for orders
 	instanceID := s.InstanceID()
-	//s.groupID = util.FNV32(instanceID)
+	// s.groupID = util.FNV32(instanceID)
 
 	// Always update the position fields
 	s.Position.Strategy = ID
@@ -179,7 +180,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			return
 		}
 
-		s.Notifiability.Notify(trade)
+		bbgo.Notify(trade)
 		s.ProfitStats.AddTrade(trade)
 
 		if profit.Compare(fixedpoint.Zero) == 0 {
@@ -189,10 +190,10 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			p := s.Position.NewProfit(trade, profit, netProfit)
 			p.Strategy = ID
 			p.StrategyInstanceID = instanceID
-			s.Notify(&p)
+			bbgo.Notify(&p)
 
 			s.ProfitStats.AddProfit(p)
-			s.Notify(&s.ProfitStats)
+			bbgo.Notify(&s.ProfitStats)
 
 			s.Environment.RecordPosition(s.Position, trade, &p)
 		}
@@ -200,7 +201,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	s.tradeCollector.OnPositionUpdate(func(position *types.Position) {
 		log.Infof("position changed: %s", s.Position)
-		s.Notify(s.Position)
+		bbgo.Notify(s.Position)
 	})
 	s.tradeCollector.BindStream(session.UserDataStream)
 	st, _ := session.MarketDataStore(s.Symbol)
@@ -263,19 +264,19 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	outlook := 1
 
-	//futuresMode := s.session.Futures || s.session.IsolatedFutures
+	// futuresMode := s.session.Futures || s.session.IsolatedFutures
 	cnt := 0
 
-	//var prevEr float64
+	// var prevEr float64
 	session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {
 
-		//if kline.Interval == types.Interval15m && kline.Symbol == s.Symbol && !s.Market.IsDustQuantity(s.Position.GetBase(), kline.Close) {
+		// if kline.Interval == types.Interval15m && kline.Symbol == s.Symbol && !s.Market.IsDustQuantity(s.Position.GetBase(), kline.Close) {
 		//	if err := s.activeMakerOrders.GracefulCancel(ctx, s.session.Exchange); err != nil {
 		//		log.WithError(err).Errorf("graceful cancel order error")
 		//	}
 		//	s.ClosePosition(ctx, fixedpoint.One)
 		//	s.tradeCollector.Process()
-		//}
+		// }
 		if kline.Symbol != s.Symbol || kline.Interval != s.Interval {
 			return
 		}
@@ -294,7 +295,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		r.SetVar(0, "S0")
 		r.SetVar(1, "S1")
 		r.SetVar(2, "S2")
-		//r.SetVar(2, "S3")
+		// r.SetVar(2, "S3")
 		r.SetVar(3, "S4")
 		r.SetVar(4, "S5")
 		r.SetVar(5, "S6")
@@ -310,7 +311,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s0 := s.S0.Values[len(s.S0.Values)-i-outlook]
 			s1 := s.S1.Values[len(s.S1.Values)-i-outlook]
 			s2 := s.S2.Values[len(s.S2.Values)-i-outlook]
-			//s3 := s.S3.Values[len(s.S3.Values)-i-1]
+			// s3 := s.S3.Values[len(s.S3.Values)-i-1]
 			s4 := s.S4.Values[len(s.S4.Values)-i-outlook]
 			s5 := s.S5.Values[len(s.S5.Values)-i-outlook]
 			s6 := s.S6.Values[len(s.S6.Values)-i-outlook]
@@ -323,7 +324,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			ret := s.R.Values[len(s.R.Values)-i]
 			rdps = append(rdps, regression.DataPoint(ret, types.Float64Slice{s0, s1, s2, s4, s5, s6, s7, a2, a3, a18, a34}))
 		}
-		//for i := 40; i > 20; i-- {
+		// for i := 40; i > 20; i-- {
 		//	s0 := preprocessing(s.S0.Values[len(s.S0.Values)-i : len(s.S0.Values)-i+20-outlook])
 		//	s1 := preprocessing(s.S1.Values[len(s.S1.Values)-i : len(s.S1.Values)-i+20-outlook])
 		//	s2 := preprocessing(s.S2.Values[len(s.S2.Values)-i : len(s.S2.Values)-i+20-outlook])
@@ -337,7 +338,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		//
 		//	ret := s.R.Values[len(s.R.Values)-i]
 		//	rdps = append(rdps, regression.DataPoint(ret, types.Float64Slice{s0, s1, s2, s4, s5, a2, a3, a18, a34}))
-		//}
+		// }
 		r.Train(rdps...)
 		r.Run()
 		er, _ := r.Predict(types.Float64Slice{s.S0.Last(), s.S1.Last(), s.S2.Last(), s.S4.Last(), s.S5.Last(), s.S6.Last(), s.S7.Last(), s.A2.Last(), s.A3.Last(), s.A18.Last(), s.A34.Last()})
@@ -348,7 +349,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		q.SetVar(0, "S0")
 		q.SetVar(1, "S1")
 		q.SetVar(2, "S2")
-		//q.SetVar(2, "S3")
+		// q.SetVar(2, "S3")
 		q.SetVar(3, "S4")
 		q.SetVar(4, "S5")
 		q.SetVar(5, "S6")
@@ -364,7 +365,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s0 := math.Pow(s.S0.Values[len(s.S0.Values)-i-outlook], 1)
 			s1 := math.Pow(s.S1.Values[len(s.S1.Values)-i-outlook], 1)
 			s2 := math.Pow(s.S2.Values[len(s.S2.Values)-i-outlook], 1)
-			//s3 := s.S3.Values[len(s.S3.Values)-i-1]
+			// s3 := s.S3.Values[len(s.S3.Values)-i-1]
 			s4 := math.Pow(s.S4.Values[len(s.S4.Values)-i-outlook], 1)
 			s5 := math.Pow(s.S5.Values[len(s.S5.Values)-i-outlook], 1)
 			s6 := s.S6.Values[len(s.S6.Values)-i-outlook]
@@ -378,7 +379,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			qty := math.Abs(ret)
 			qdps = append(qdps, regression.DataPoint(qty, types.Float64Slice{s0, s1, s2, s4, s5, s6, s7, a2, a3, a18, a34}))
 		}
-		//for i := 40; i > 20; i-- {
+		// for i := 40; i > 20; i-- {
 		//	s0 := preprocessing(s.S0.Values[len(s.S0.Values)-i : len(s.S0.Values)-i+20-outlook])
 		//	s1 := preprocessing(s.S1.Values[len(s.S1.Values)-i : len(s.S1.Values)-i+20-outlook])
 		//	s2 := preprocessing(s.S2.Values[len(s.S2.Values)-i : len(s.S2.Values)-i+20-outlook])
@@ -393,7 +394,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		//	ret := s.R.Values[len(s.R.Values)-i]
 		//	qty := math.Abs(ret)
 		//	qdps = append(qdps, regression.DataPoint(qty, types.Float64Slice{s0, s1, s2, s4, s5, a2, a3, a18, a34}))
-		//}
+		// }
 		q.Train(qdps...)
 
 		q.Run()
@@ -403,27 +404,27 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		log.Infof("Return Rate Regression formula:\n%v", r.Formula)
 		log.Infof("Order Quantity Regression formula:\n%v", q.Formula)
 
-		//s0 := preprocessing(s.S0.Values[len(s.S0.Values)-20 : len(s.S0.Values)-1])
-		//s1 := preprocessing(s.S1.Values[len(s.S1.Values)-20 : len(s.S1.Values)-1-outlook])
-		//s2 := preprocessing(s.S2.Values[len(s.S2.Values)-20 : len(s.S2.Values)-1-outlook])
-		////s3 := s.S3.Values[len(s.S3.Values)-i-1]
-		//s4 := preprocessing(s.S4.Values[len(s.S4.Values)-20 : len(s.S4.Values)-1-outlook])
-		//s5 := preprocessing(s.S5.Values[len(s.S5.Values)-20 : len(s.S5.Values)-1-outlook])
-		//a2 := preprocessing(s.A2.Values[len(s.A2.Values)-20 : len(s.A2.Values)-1-outlook])
-		//a3 := preprocessing(s.A3.Values[len(s.A3.Values)-20 : len(s.A3.Values)-1-outlook])
-		//a18 := preprocessing(s.A18.Values[len(s.A18.Values)-20 : len(s.A18.Values)-1-outlook])
-		//a34 := preprocessing(s.A18.Values[len(s.A18.Values)-20 : len(s.A18.Values)-1-outlook])
-		//er, _ := r.Predict(types.Float64Slice{s0, s1, s2, s4, s5, a2, a3, a18, a34})
-		//eq, _ := q.Predict(types.Float64Slice{s0, s1, s2, s4, s5, a2, a3, a18, a34})
+		// s0 := preprocessing(s.S0.Values[len(s.S0.Values)-20 : len(s.S0.Values)-1])
+		// s1 := preprocessing(s.S1.Values[len(s.S1.Values)-20 : len(s.S1.Values)-1-outlook])
+		// s2 := preprocessing(s.S2.Values[len(s.S2.Values)-20 : len(s.S2.Values)-1-outlook])
+		// //s3 := s.S3.Values[len(s.S3.Values)-i-1]
+		// s4 := preprocessing(s.S4.Values[len(s.S4.Values)-20 : len(s.S4.Values)-1-outlook])
+		// s5 := preprocessing(s.S5.Values[len(s.S5.Values)-20 : len(s.S5.Values)-1-outlook])
+		// a2 := preprocessing(s.A2.Values[len(s.A2.Values)-20 : len(s.A2.Values)-1-outlook])
+		// a3 := preprocessing(s.A3.Values[len(s.A3.Values)-20 : len(s.A3.Values)-1-outlook])
+		// a18 := preprocessing(s.A18.Values[len(s.A18.Values)-20 : len(s.A18.Values)-1-outlook])
+		// a34 := preprocessing(s.A18.Values[len(s.A18.Values)-20 : len(s.A18.Values)-1-outlook])
+		// er, _ := r.Predict(types.Float64Slice{s0, s1, s2, s4, s5, a2, a3, a18, a34})
+		// eq, _ := q.Predict(types.Float64Slice{s0, s1, s2, s4, s5, a2, a3, a18, a34})
 		eq, _ := q.Predict(types.Float64Slice{s.S0.Last(), s.S1.Last(), s.S2.Last(), s.S4.Last(), s.S5.Last(), s.S6.Last(), s.S7.Last(), s.A2.Last(), s.A3.Last(), s.A18.Last(), s.A34.Last(), er})
 		log.Infof("Expected Order Quantity: %f", eq)
-		//if float64(s.Position.GetBase().Sign())*er < 0 {
+		// if float64(s.Position.GetBase().Sign())*er < 0 {
 		//	s.ClosePosition(ctx, fixedpoint.One, kline.Close)
 		//	s.tradeCollector.Process()
-		//}
-		//prevEr = er
+		// }
+		// prevEr = er
 
-		//spd := s.Spread.Float64()
+		// spd := s.Spread.Float64()
 
 		// inventory = m * alpha + spread
 		AskAlphaBoundary := (s.Position.GetBase().Mul(kline.Close).Float64() - 100) / 10000
@@ -433,11 +434,11 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 		BidPrice := kline.Close.Mul(fixedpoint.One.Sub(s.Spread))
 		BidQty := s.QuantityOrAmount.CalculateQuantity(BidPrice)
-		BidQty = BidQty //.Mul(fixedpoint.One.Add(fixedpoint.NewFromFloat(eq)))
+		BidQty = BidQty // .Mul(fixedpoint.One.Add(fixedpoint.NewFromFloat(eq)))
 
 		AskPrice := kline.Close.Mul(fixedpoint.One.Add(s.Spread))
 		AskQty := s.QuantityOrAmount.CalculateQuantity(AskPrice)
-		AskQty = AskQty //.Mul(fixedpoint.One.Add(fixedpoint.NewFromFloat(eq)))
+		AskQty = AskQty // .Mul(fixedpoint.One.Add(fixedpoint.NewFromFloat(eq)))
 
 		if er > 0 || (er < 0 && er > AskAlphaBoundary/kline.Close.Float64()) {
 			submitOrder := types.SubmitOrder{
@@ -445,7 +446,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 				Side:     types.SideTypeBuy,
 				Type:     types.OrderTypeLimitMaker,
 				Price:    BidPrice,
-				Quantity: BidQty, //0.0005
+				Quantity: BidQty, // 0.0005
 			}
 			createdOrders, err := orderExecutor.SubmitOrders(ctx, submitOrder)
 			if err != nil {
@@ -455,20 +456,20 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s.activeMakerOrders.Add(createdOrders...)
 			s.tradeCollector.Process()
 
-			//submitOrder = types.SubmitOrder{
+			// submitOrder = types.SubmitOrder{
 			//	Symbol:   s.Symbol,
 			//	Side:     types.SideTypeSell,
 			//	Type:     types.OrderTypeLimitMaker,
 			//	Price:    kline.Close.Mul(fixedpoint.One.Add(s.Spread)),
 			//	Quantity: fixedpoint.NewFromFloat(math.Max(math.Min(eq, 0.003), 0.0005)), //0.0005
-			//}
-			//createdOrders, err = orderExecutor.SubmitOrders(ctx, submitOrder)
-			//if err != nil {
+			// }
+			// createdOrders, err = orderExecutor.SubmitOrders(ctx, submitOrder)
+			// if err != nil {
 			//	log.WithError(err).Errorf("can not place orders")
-			//}
-			//s.orderStore.Add(createdOrders...)
-			//s.activeMakerOrders.Add(createdOrders...)
-			//s.tradeCollector.Process()
+			// }
+			// s.orderStore.Add(createdOrders...)
+			// s.activeMakerOrders.Add(createdOrders...)
+			// s.tradeCollector.Process()
 		}
 		if er < 0 || (er > 0 && er < BidAlphaBoundary/kline.Close.Float64()) {
 			submitOrder := types.SubmitOrder{
@@ -476,7 +477,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 				Side:     types.SideTypeSell,
 				Type:     types.OrderTypeLimitMaker,
 				Price:    AskPrice,
-				Quantity: AskQty, //0.0005
+				Quantity: AskQty, // 0.0005
 			}
 			createdOrders, err := orderExecutor.SubmitOrders(ctx, submitOrder)
 			if err != nil {
@@ -486,20 +487,20 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			s.activeMakerOrders.Add(createdOrders...)
 			s.tradeCollector.Process()
 
-			//submitOrder = types.SubmitOrder{
+			// submitOrder = types.SubmitOrder{
 			//	Symbol:   s.Symbol,
 			//	Side:     types.SideTypeBuy,
 			//	Type:     types.OrderTypeLimitMaker,
 			//	Price:    kline.Close.Mul(fixedpoint.One.Sub(s.Spread)),
 			//	Quantity: fixedpoint.NewFromFloat(math.Max(math.Min(eq, 0.003), 0.0005)), //0.0005
-			//}
-			//createdOrders, err = orderExecutor.SubmitOrders(ctx, submitOrder)
-			//if err != nil {
+			// }
+			// createdOrders, err = orderExecutor.SubmitOrders(ctx, submitOrder)
+			// if err != nil {
 			//	log.WithError(err).Errorf("can not place orders")
-			//}
-			//s.orderStore.Add(createdOrders...)
-			//s.activeMakerOrders.Add(createdOrders...)
-			//s.tradeCollector.Process()
+			// }
+			// s.orderStore.Add(createdOrders...)
+			// s.activeMakerOrders.Add(createdOrders...)
+			// s.tradeCollector.Process()
 		}
 
 	})
@@ -526,7 +527,7 @@ func stddev(xs []float64) float64 {
 }
 
 func preprocessing(xs []float64) float64 {
-	//return 0.5 * tanh(0.01*((xs[len(xs)-1]-mean(xs))/stddev(xs))) // tanh estimator
+	// return 0.5 * tanh(0.01*((xs[len(xs)-1]-mean(xs))/stddev(xs))) // tanh estimator
 	return tanh((xs[len(xs)-1] - mean(xs)) / stddev(xs)) // tanh z-score
 	return (xs[len(xs)-1] - mean(xs)) / stddev(xs)       // z-score
 }

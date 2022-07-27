@@ -25,11 +25,6 @@ func init() {
 }
 
 type Strategy struct {
-	*bbgo.Graceful
-
-	// The notification system will be injected into the strategy automatically.
-	// This field will be injected automatically since it's a single exchange strategy.
-	*bbgo.Notifiability
 
 	SourceExchangeName string `json:"sourceExchange"`
 
@@ -221,7 +216,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		s.place(ctx, orderExecutor, session, indicator, closePrice)
 	})
 
-	s.Graceful.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
+	bbgo.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
 		defer wg.Done()
 		log.Infof("canceling trailingstop order...")
 		s.clear(ctx, orderExecutor)
@@ -265,7 +260,7 @@ func (s *Strategy) CrossRun(ctx context.Context, _ bbgo.OrderExecutionRouter, se
 		s.place(ctx, &orderExecutor, session, indicator, closePrice)
 	})
 
-	s.Graceful.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
+	bbgo.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
 		defer wg.Done()
 		log.Infof("canceling trailingstop order...")
 		s.clear(ctx, &orderExecutor)

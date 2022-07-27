@@ -10,6 +10,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	log "github.com/sirupsen/logrus"
 
+	exchange2 "github.com/c9s/bbgo/pkg/exchange"
 	"github.com/c9s/bbgo/pkg/exchange/batch"
 	"github.com/c9s/bbgo/pkg/types"
 )
@@ -19,7 +20,7 @@ type OrderService struct {
 }
 
 func (s *OrderService) Sync(ctx context.Context, exchange types.Exchange, symbol string, startTime time.Time) error {
-	isMargin, isFutures, isIsolated, isolatedSymbol := getExchangeAttributes(exchange)
+	isMargin, isFutures, isIsolated, isolatedSymbol := exchange2.GetSessionAttributes(exchange)
 	// override symbol if isolatedSymbol is not empty
 	if isIsolated && len(isolatedSymbol) > 0 {
 		symbol = isolatedSymbol
@@ -71,6 +72,7 @@ func (s *OrderService) Sync(ctx context.Context, exchange types.Exchange, symbol
 				order := obj.(types.Order)
 				return s.Insert(order)
 			},
+			LogInsert: true,
 		},
 	}
 
@@ -93,7 +95,7 @@ func SelectLastOrders(ex types.ExchangeName, symbol string, isMargin, isFutures,
 			sq.Eq{"is_futures": isFutures},
 			sq.Eq{"is_isolated": isIsolated},
 		}).
-		OrderBy("gid DESC").
+		OrderBy("created_at DESC").
 		Limit(limit)
 }
 

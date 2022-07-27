@@ -6,33 +6,47 @@ import (
 	"github.com/c9s/bbgo/pkg/types"
 )
 
-// Refer: Running Moving Average
+// Running Moving Average
+// Refer: https://github.com/twopirllc/pandas-ta/blob/main/pandas_ta/overlap/rma.py#L5
+// Refer: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.ewm.html#pandas-dataframe-ewm
 //go:generate callbackgen -type RMA
 type RMA struct {
+	types.SeriesBase
 	types.IntervalWindow
-	Values  types.Float64Slice
-	Sources types.Float64Slice
 
-	EndTime         time.Time
-	UpdateCallbacks []func(value float64)
+	Values  types.Float64Slice
+	EndTime time.Time
+
+	counter int
+	Adjust  bool
+	tmp     float64
+	sum     float64
+
+	updateCallbacks []func(value float64)
 }
 
 func (inc *RMA) Update(x float64) {
-	inc.Sources.Push(x)
+	lambda := 1 / float64(inc.Window)
+	if inc.counter == 0 {
+		inc.SeriesBase.Series = inc
+		inc.sum = 1
+		inc.tmp = x
+	} else {
+		if inc.Adjust {
+			inc.sum = inc.sum*(1-lambda) + 1
+			inc.tmp = inc.tmp + (x-inc.tmp)/inc.sum
+		} else {
+			inc.tmp = inc.tmp*(1-lambda) + x*lambda
+		}
+	}
+	inc.counter++
 
-	if len(inc.Sources) < inc.Window {
+	if inc.counter < inc.Window {
 		inc.Values.Push(0)
 		return
 	}
 
-	if len(inc.Sources) == inc.Window {
-		inc.Values.Push(inc.Sources.Mean())
-		return
-	}
-
-	lambda := 1 / float64(inc.Window)
-	rma := (1-lambda)*inc.Values.Last() + lambda*x
-	inc.Values.Push(rma)
+	inc.Values.Push(inc.tmp)
 }
 
 func (inc *RMA) Last() float64 {
@@ -51,25 +65,37 @@ func (inc *RMA) Length() int {
 	return len(inc.Values)
 }
 
-var _ types.Series = &RMA{}
+var _ types.SeriesExtend = &RMA{}
 
-func (inc *RMA) calculateAndUpdate(kLines []types.KLine) {
-	for _, k := range kLines {
-		if inc.EndTime != zeroTime && !k.EndTime.After(inc.EndTime) {
-			continue
+func (inc *RMA) PushK(k types.KLine) {
+	inc.Update(k.Close.Float64())
+}
+
+func (inc *RMA) CalculateAndUpdate(kLines []types.KLine) {
+	last := kLines[len(kLines)-1]
+
+	if len(inc.Values) == 0 {
+		for _, k := range kLines {
+			if inc.EndTime != zeroTime && !k.EndTime.After(inc.EndTime) {
+				continue
+			}
+
+			inc.PushK(k)
 		}
-		inc.Update(k.Close.Float64())
+	} else {
+		inc.PushK(last)
 	}
 
 	inc.EmitUpdate(inc.Last())
-	inc.EndTime = kLines[len(kLines)-1].EndTime.Time()
+	inc.EndTime = last.EndTime.Time()
 }
+
 func (inc *RMA) handleKLineWindowUpdate(interval types.Interval, window types.KLineWindow) {
 	if inc.Interval != interval {
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *RMA) Bind(updater KLineWindowUpdater) {

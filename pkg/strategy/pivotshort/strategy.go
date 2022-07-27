@@ -3,15 +3,22 @@ package pivotshort
 import (
 	"context"
 	"fmt"
+	"os"
+	"sync"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/c9s/bbgo/pkg/bbgo"
+	"github.com/c9s/bbgo/pkg/dynamic"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/indicator"
 	"github.com/c9s/bbgo/pkg/types"
-	"github.com/sirupsen/logrus"
 )
 
 const ID = "pivotshort"
+
+var one = fixedpoint.One
+var zero = fixedpoint.Zero
 
 var log = logrus.WithField("strategy", ID)
 
@@ -23,49 +30,152 @@ type IntervalWindowSetting struct {
 	types.IntervalWindow
 }
 
-type Entry struct {
-	Immediate        bool                            `json:"immediate"`
-	CatBounceRatio   fixedpoint.Value                `json:"catBounceRatio"`
-	Quantity         fixedpoint.Value                `json:"quantity"`
-	NumLayers        fixedpoint.Value                `json:"numLayers"`
-	MarginSideEffect types.MarginOrderSideEffectType `json:"marginOrderSideEffect"`
+type SupportTakeProfit struct {
+	Symbol string
+	types.IntervalWindow
+
+	Ratio fixedpoint.Value `json:"ratio"`
+
+	pivot               *indicator.Pivot
+	orderExecutor       *bbgo.GeneralOrderExecutor
+	session             *bbgo.ExchangeSession
+	activeOrders        *bbgo.ActiveOrderBook
+	currentSupportPrice fixedpoint.Value
+
+	triggeredPrices []fixedpoint.Value
 }
 
-type Exit struct {
-	TakeProfitPercentage fixedpoint.Value                `json:"takeProfitPercentage"`
-	StopLossPercentage   fixedpoint.Value                `json:"stopLossPercentage"`
-	ShadowTPRatio        fixedpoint.Value                `json:"shadowTakeProfitRatio"`
-	MarginSideEffect     types.MarginOrderSideEffectType `json:"marginOrderSideEffect"`
+func (s *SupportTakeProfit) Subscribe(session *bbgo.ExchangeSession) {
+	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.Interval})
+}
+
+func (s *SupportTakeProfit) Bind(session *bbgo.ExchangeSession, orderExecutor *bbgo.GeneralOrderExecutor) {
+	s.session = session
+	s.orderExecutor = orderExecutor
+	s.activeOrders = bbgo.NewActiveOrderBook(s.Symbol)
+	session.UserDataStream.OnOrderUpdate(func(order types.Order) {
+		if s.activeOrders.Exists(order) {
+			if !s.currentSupportPrice.IsZero() {
+				s.triggeredPrices = append(s.triggeredPrices, s.currentSupportPrice)
+			}
+		}
+	})
+	s.activeOrders.BindStream(session.UserDataStream)
+
+	position := orderExecutor.Position()
+	symbol := position.Symbol
+	store, _ := session.MarketDataStore(symbol)
+	s.pivot = &indicator.Pivot{IntervalWindow: s.IntervalWindow}
+	s.pivot.Bind(store)
+	preloadPivot(s.pivot, store)
+
+	session.MarketDataStream.OnKLineClosed(types.KLineWith(s.Symbol, s.Interval, func(kline types.KLine) {
+		if !s.updateSupportPrice(kline.Close) {
+			return
+		}
+
+		if !position.IsOpened(kline.Close) {
+			log.Infof("position is not opened, skip updating support take profit order")
+			return
+		}
+
+		buyPrice := s.currentSupportPrice.Mul(one.Add(s.Ratio))
+		quantity := position.GetQuantity()
+		ctx := context.Background()
+
+		if err := orderExecutor.GracefulCancelActiveOrderBook(ctx, s.activeOrders); err != nil {
+			log.WithError(err).Errorf("cancel order failed")
+		}
+
+		bbgo.Notify("placing %s take profit order at price %f", s.Symbol, buyPrice.Float64())
+		createdOrders, err := orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
+			Symbol:   symbol,
+			Type:     types.OrderTypeLimitMaker,
+			Side:     types.SideTypeBuy,
+			Price:    buyPrice,
+			Quantity: quantity,
+			Tag:      "supportTakeProfit",
+		})
+
+		if err != nil {
+			log.WithError(err).Errorf("can not submit orders: %+v", createdOrders)
+		}
+
+		s.activeOrders.Add(createdOrders...)
+	}))
+}
+
+func (s *SupportTakeProfit) updateSupportPrice(closePrice fixedpoint.Value) bool {
+	log.Infof("[supportTakeProfit] lows: %v", s.pivot.Lows)
+
+	groupDistance := 0.01
+	minDistance := 0.05
+	supportPrices := findPossibleSupportPrices(closePrice.Float64()*(1.0-minDistance), groupDistance, s.pivot.Lows)
+	if len(supportPrices) == 0 {
+		return false
+	}
+
+	log.Infof("[supportTakeProfit] found possible support prices: %v", supportPrices)
+
+	// nextSupportPrice are sorted in increasing order
+	nextSupportPrice := fixedpoint.NewFromFloat(supportPrices[len(supportPrices)-1])
+
+	// it's price that we have been used to take profit
+	for _, p := range s.triggeredPrices {
+		var l = p.Mul(one.Sub(fixedpoint.NewFromFloat(0.01)))
+		var h = p.Mul(one.Add(fixedpoint.NewFromFloat(0.01)))
+		if p.Compare(l) > 0 && p.Compare(h) < 0 {
+			return false
+		}
+	}
+
+	currentBuyPrice := s.currentSupportPrice.Mul(one.Add(s.Ratio))
+
+	if s.currentSupportPrice.IsZero() {
+		log.Infof("setup next support take profit price at %f", nextSupportPrice.Float64())
+		s.currentSupportPrice = nextSupportPrice
+		return true
+	}
+
+	// the close price is already lower than the support price, than we should update
+	if closePrice.Compare(currentBuyPrice) < 0 || nextSupportPrice.Compare(s.currentSupportPrice) > 0 {
+		log.Infof("setup next support take profit price at %f", nextSupportPrice.Float64())
+		s.currentSupportPrice = nextSupportPrice
+		return true
+	}
+
+	return false
 }
 
 type Strategy struct {
-	*bbgo.Graceful
-	*bbgo.Notifiability
-	*bbgo.Persistence
+	Environment *bbgo.Environment
+	Symbol      string `json:"symbol"`
+	Market      types.Market
 
-	Environment   *bbgo.Environment
-	Symbol        string `json:"symbol"`
-	Market        types.Market
-	Interval      types.Interval   `json:"interval"`
-	TotalQuantity fixedpoint.Value `json:"totalQuantity"`
+	// pivot interval and window
+	types.IntervalWindow
+
+	Leverage fixedpoint.Value `json:"leverage"`
+	Quantity fixedpoint.Value `json:"quantity"`
 
 	// persistence fields
-	Position    *types.Position    `json:"position,omitempty" persistence:"position"`
-	ProfitStats *types.ProfitStats `json:"profitStats,omitempty" persistence:"profit_stats"`
 
-	PivotLength int `json:"pivotLength"`
+	Position    *types.Position    `persistence:"position"`
+	ProfitStats *types.ProfitStats `persistence:"profit_stats"`
+	TradeStats  *types.TradeStats  `persistence:"trade_stats"`
 
-	Entry Entry
-	Exit  Exit
+	// BreakLow is one of the entry method
+	BreakLow *BreakLow `json:"breakLow"`
 
-	activeMakerOrders *bbgo.LocalActiveOrderBook
-	orderStore        *bbgo.OrderStore
-	tradeCollector    *bbgo.TradeCollector
+	// ResistanceShort is one of the entry method
+	ResistanceShort *ResistanceShort `json:"resistanceShort"`
 
-	session *bbgo.ExchangeSession
+	SupportTakeProfit []*SupportTakeProfit `json:"supportTakeProfit"`
 
-	pivot       *indicator.Pivot
-	pivotBuffer []fixedpoint.Value
+	ExitMethods bbgo.ExitMethodSet `json:"exits"`
+
+	session       *bbgo.ExchangeSession
+	orderExecutor *bbgo.GeneralOrderExecutor
 
 	// StrategyController
 	bbgo.StrategyController
@@ -76,234 +186,128 @@ func (s *Strategy) ID() string {
 }
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
-	log.Infof("subscribe %s", s.Symbol)
 	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.Interval})
-	//session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: types.Interval1d})
+	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: types.Interval1m})
+
+	if s.ResistanceShort != nil && s.ResistanceShort.Enabled {
+		dynamic.InheritStructValues(s.ResistanceShort, s)
+		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.ResistanceShort.Interval})
+	}
+
+	if s.BreakLow != nil {
+		dynamic.InheritStructValues(s.BreakLow, s)
+		s.BreakLow.Subscribe(session)
+	}
+
+	for i := range s.SupportTakeProfit {
+		m := s.SupportTakeProfit[i]
+		dynamic.InheritStructValues(m, s)
+		m.Subscribe(session)
+	}
+
+	if !bbgo.IsBackTesting {
+		session.Subscribe(types.MarketTradeChannel, s.Symbol, types.SubscribeOptions{})
+	}
+
+	s.ExitMethods.SetAndSubscribe(session, s)
 }
 
-func (s *Strategy) placeOrder(ctx context.Context, marketPrice fixedpoint.Value, limitPrice fixedpoint.Value, currentPrice fixedpoint.Value, qty fixedpoint.Value, orderExecutor bbgo.OrderExecutor) {
-	submitOrder := types.SubmitOrder{
-		Symbol:   s.Symbol,
-		Side:     types.SideTypeSell,
-		Type:     types.OrderTypeLimit,
-		Price:    limitPrice,
-		Quantity: qty,
-	}
-	if s.Entry.Immediate && marketPrice.Compare(currentPrice) <= 0 {
-		submitOrder.Type = types.OrderTypeMarket
-	}
-	if s.session.Margin {
-		submitOrder.MarginSideEffect = s.Entry.MarginSideEffect
-	}
-
-	createdOrders, err := orderExecutor.SubmitOrders(ctx, submitOrder)
-	if err != nil {
-		log.WithError(err).Errorf("can not place orders")
-	}
-	s.orderStore.Add(createdOrders...)
-	s.activeMakerOrders.Add(createdOrders...)
-	//s.tradeCollector.Process()
-}
-
-func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Value) error {
-	base := s.Position.GetBase()
-	if base.IsZero() {
-		return fmt.Errorf("no opened %s position", s.Position.Symbol)
-	}
-
-	// make it negative
-	quantity := base.Mul(percentage).Abs()
-	side := types.SideTypeBuy
-	if base.Sign() > 0 {
-		side = types.SideTypeSell
-	}
-
-	if quantity.Compare(s.Market.MinQuantity) < 0 {
-		return fmt.Errorf("order quantity %v is too small, less than %v", quantity, s.Market.MinQuantity)
-	}
-
-	submitOrder := types.SubmitOrder{
-		Symbol:   s.Symbol,
-		Side:     side,
-		Type:     types.OrderTypeMarket,
-		Quantity: quantity,
-		Market:   s.Market,
-	}
-	if s.session.Margin {
-		submitOrder.MarginSideEffect = s.Exit.MarginSideEffect
-	}
-
-	//s.Notify("Submitting %s %s order to close position by %v", s.Symbol, side.String(), percentage, submitOrder)
-
-	createdOrders, err := s.session.Exchange.SubmitOrders(ctx, submitOrder)
-	if err != nil {
-		log.WithError(err).Errorf("can not place position close order")
-	}
-
-	s.orderStore.Add(createdOrders...)
-	s.activeMakerOrders.Add(createdOrders...)
-	return err
-}
 func (s *Strategy) InstanceID() string {
 	return fmt.Sprintf("%s:%s", ID, s.Symbol)
 }
 
-// check if position can be close or not
-func canClosePosition(position *types.Position, signal fixedpoint.Value, price fixedpoint.Value) bool {
-	return !signal.IsZero() && position.IsShort() && !position.IsDust(price)
+func (s *Strategy) CurrentPosition() *types.Position {
+	return s.Position
 }
 
-// get last available pivot low, the most recent pivot point higher than current price
-func (s *Strategy) getValidPivotLow(price fixedpoint.Value) fixedpoint.Value {
-	for l := len(s.pivotBuffer) - 1; l > 0; l-- {
-		if s.pivotBuffer[l].Compare(price) > 0 {
-			return s.pivotBuffer[l]
-		}
-	}
-	return price
+func (s *Strategy) ClosePosition(ctx context.Context, percentage fixedpoint.Value) error {
+	return s.orderExecutor.ClosePosition(ctx, percentage)
 }
 
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
-	// initial required information
-	s.session = session
-
-	s.activeMakerOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
-	s.activeMakerOrders.BindStream(session.UserDataStream)
-
-	s.orderStore = bbgo.NewOrderStore(s.Symbol)
-	s.orderStore.BindStream(session.UserDataStream)
+	var instanceID = s.InstanceID()
 
 	if s.Position == nil {
 		s.Position = types.NewPositionFromMarket(s.Market)
 	}
 
-	instanceID := s.InstanceID()
-
-	// Always update the position fields
-	s.Position.Strategy = ID
-	s.Position.StrategyInstanceID = instanceID
-
-	s.tradeCollector = bbgo.NewTradeCollector(s.Symbol, s.Position, s.orderStore)
-	s.tradeCollector.OnTrade(func(trade types.Trade, profit, netProfit fixedpoint.Value) {
-		// StrategyController
-		if s.Status != types.StrategyStatusRunning {
-			return
-		}
-
-		s.Notifiability.Notify(trade)
-		s.ProfitStats.AddTrade(trade)
-
-		if profit.Compare(fixedpoint.Zero) == 0 {
-			s.Environment.RecordPosition(s.Position, trade, nil)
-		} else {
-			log.Infof("%s generated profit: %v", s.Symbol, profit)
-			p := s.Position.NewProfit(trade, profit, netProfit)
-			p.Strategy = ID
-			p.StrategyInstanceID = instanceID
-			s.Notify(&p)
-
-			s.ProfitStats.AddProfit(p)
-			s.Notify(&s.ProfitStats)
-
-			s.Environment.RecordPosition(s.Position, trade, &p)
-		}
-	})
-
-	s.tradeCollector.OnPositionUpdate(func(position *types.Position) {
-		log.Infof("position changed: %s", s.Position)
-		s.Notify(s.Position)
-	})
-	s.tradeCollector.BindStream(session.UserDataStream)
-
-	iw := types.IntervalWindow{Window: s.PivotLength, Interval: s.Interval}
-	st, _ := session.MarketDataStore(s.Symbol)
-	s.pivot = &indicator.Pivot{IntervalWindow: iw}
-	s.pivot.Bind(st)
-
-	session.UserDataStream.OnStart(func() {
-		log.Infof("connected")
-	})
-
-	var lastLow fixedpoint.Value
-	futuresMode := s.session.Futures || s.session.IsolatedFutures
-	d := s.Entry.CatBounceRatio.Div(s.Entry.NumLayers)
-	q := s.Entry.Quantity
-	if !s.TotalQuantity.IsZero() {
-		q = s.TotalQuantity.Div(s.Entry.NumLayers)
+	if s.ProfitStats == nil {
+		s.ProfitStats = types.NewProfitStats(s.Market)
 	}
 
-	session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {
-		if kline.Symbol != s.Symbol || kline.Interval != s.Interval {
-			return
-		}
+	if s.TradeStats == nil {
+		s.TradeStats = types.NewTradeStats(s.Symbol)
+	}
 
-		if s.pivot.LastLow() > 0. {
-			log.Infof("pivot low signal detected: %f %s", s.pivot.LastLow(), kline.EndTime.Time())
-			lastLow = fixedpoint.NewFromFloat(s.pivot.LastLow())
-		} else {
-			if canClosePosition(s.Position, lastLow, kline.Close) {
-				R := kline.Close.Div(s.Position.AverageCost)
-				if R.Compare(fixedpoint.One.Add(s.Exit.StopLossPercentage)) > 0 {
-					// SL
-					log.Infof("%s SL triggered", s.Symbol)
-					s.ClosePosition(ctx, fixedpoint.One)
-					s.tradeCollector.Process()
-				} else if R.Compare(fixedpoint.One.Sub(s.Exit.TakeProfitPercentage)) < 0 {
-					// TP
-					log.Infof("%s TP triggered", s.Symbol)
-					s.ClosePosition(ctx, fixedpoint.One)
-				} else if kline.GetLowerShadowHeight().Div(kline.Close).Compare(s.Exit.ShadowTPRatio) > 0 {
-					// shadow TP
-					log.Infof("%s shadow TP triggered", s.Symbol)
-					s.ClosePosition(ctx, fixedpoint.One)
-					s.tradeCollector.Process()
-				}
-			}
-			lastLow = fixedpoint.Zero
-		}
+	if s.Leverage.IsZero() {
+		// the default leverage is 3x
+		s.Leverage = fixedpoint.NewFromInt(3)
+	}
 
-		if !lastLow.IsZero() {
+	// StrategyController
+	s.Status = types.StrategyStatusRunning
 
-			s.pivotBuffer = append(s.pivotBuffer, lastLow)
+	s.OnSuspend(func() {
+		// Cancel active orders
+		_ = s.orderExecutor.GracefulCancel(ctx)
+	})
 
-			if err := s.activeMakerOrders.GracefulCancel(ctx, s.session.Exchange); err != nil {
-				log.WithError(err).Errorf("graceful cancel order error")
-			}
+	s.OnEmergencyStop(func() {
+		// Cancel active orders
+		_ = s.orderExecutor.GracefulCancel(ctx)
+		// Close 100% position
+		_ = s.ClosePosition(ctx, fixedpoint.One)
+	})
 
-			limitPrice := s.getValidPivotLow(kline.Close)
-			log.Infof("place limit sell start from %f adds up to %f percent with %f layers of orders", limitPrice.Float64(), s.Entry.CatBounceRatio.Mul(fixedpoint.NewFromInt(100)).Float64(), s.Entry.NumLayers.Float64())
+	// initial required information
+	s.session = session
+	s.orderExecutor = bbgo.NewGeneralOrderExecutor(session, s.Symbol, ID, instanceID, s.Position)
+	s.orderExecutor.BindEnvironment(s.Environment)
+	s.orderExecutor.BindProfitStats(s.ProfitStats)
+	s.orderExecutor.BindTradeStats(s.TradeStats)
+	s.orderExecutor.TradeCollector().OnPositionUpdate(func(position *types.Position) {
+		bbgo.Sync(s)
+	})
+	s.orderExecutor.Bind()
 
-			for i := 0; i < int(s.Entry.NumLayers.Float64()); i++ {
-				balances := s.session.GetAccount().Balances()
-				quoteBalance, _ := balances[s.Market.QuoteCurrency]
-				baseBalance, _ := balances[s.Market.BaseCurrency]
+	s.ExitMethods.Bind(session, s.orderExecutor)
 
-				p := limitPrice.Mul(fixedpoint.One.Add(s.Entry.CatBounceRatio.Sub(fixedpoint.NewFromFloat(d.Float64() * float64(i)))))
+	if s.ResistanceShort != nil && s.ResistanceShort.Enabled {
+		s.ResistanceShort.Bind(session, s.orderExecutor)
+	}
 
-				if futuresMode {
-					//log.Infof("futures mode on")
-					if q.Mul(p).Compare(quoteBalance.Available) <= 0 {
-						s.placeOrder(ctx, lastLow, p, kline.Close, q, orderExecutor)
-						s.tradeCollector.Process()
-					}
-				} else if s.Environment.IsBackTesting() {
-					//log.Infof("spot backtest mode on")
-					if q.Compare(baseBalance.Available) <= 0 {
-						s.placeOrder(ctx, lastLow, p, kline.Close, q, orderExecutor)
-						s.tradeCollector.Process()
-					}
-				} else {
-					//log.Infof("spot mode on")
-					if q.Compare(baseBalance.Available) <= 0 {
-						s.placeOrder(ctx, lastLow, p, kline.Close, q, orderExecutor)
-						s.tradeCollector.Process()
-					}
-				}
+	if s.BreakLow != nil {
+		s.BreakLow.Bind(session, s.orderExecutor)
+	}
 
-			}
-			//s.placeOrder(ctx, lastLow.Mul(fixedpoint.One.Add(s.CatBounceRatio)), s.Quantity, orderExecutor)
-		}
+	for i := range s.SupportTakeProfit {
+		s.SupportTakeProfit[i].Bind(session, s.orderExecutor)
+	}
+
+	bbgo.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
+		defer wg.Done()
+
+		_, _ = fmt.Fprintln(os.Stderr, s.TradeStats.String())
+		_ = s.orderExecutor.GracefulCancel(ctx)
 	})
 
 	return nil
+}
+
+func preloadPivot(pivot *indicator.Pivot, store *bbgo.MarketDataStore) *types.KLine {
+	klines, ok := store.KLinesOfInterval(pivot.Interval)
+	if !ok {
+		return nil
+	}
+
+	last := (*klines)[len(*klines)-1]
+	log.Debugf("updating pivot indicator: %d klines", len(*klines))
+
+	for i := pivot.Window; i < len(*klines); i++ {
+		pivot.CalculateAndUpdate((*klines)[0 : i+1])
+	}
+
+	log.Debugf("found %v previous lows: %v", pivot.IntervalWindow, pivot.Lows)
+	log.Debugf("found %v previous highs: %v", pivot.IntervalWindow, pivot.Highs)
+	return &last
 }

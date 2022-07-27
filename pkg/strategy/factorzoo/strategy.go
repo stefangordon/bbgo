@@ -9,6 +9,7 @@ import (
 
 	"github.com/c9s/bbgo/pkg/bbgo"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
+	"github.com/c9s/bbgo/pkg/indicator"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -34,7 +35,7 @@ type Strategy struct {
 
 	Position *types.Position `json:"position,omitempty"`
 
-	activeMakerOrders *bbgo.LocalActiveOrderBook
+	activeMakerOrders *bbgo.ActiveOrderBook
 	orderStore        *bbgo.OrderStore
 	tradeCollector    *bbgo.TradeCollector
 
@@ -55,6 +56,10 @@ type Strategy struct {
 
 func (s *Strategy) ID() string {
 	return ID
+}
+
+func (s *Strategy) InstanceID() string {
+	return fmt.Sprintf("%s:%s", ID, s.Symbol)
 }
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
@@ -149,13 +154,19 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	// s.pvDivergence.OnUpdate(func(corr float64) {
 	//	//fmt.Printf("now we've got corr: %f\n", corr)
 	// })
+	windowSize := 360 / s.Interval.Minutes()
+	if windowSize == 0 {
+		windowSize = 3
+	}
+	drift := &indicator.Drift{IntervalWindow: types.IntervalWindow{Window: windowSize, Interval: s.Interval}}
+	drift.Bind(st)
 
-	s.Alpha = [][]float64{{}, {}, {}, {}, {}}
+	s.Alpha = [][]float64{{}, {}, {}, {}, {}, {}}
 	s.Ret = []float64{}
 	// thetas := []float64{0, 0, 0, 0}
 	preCompute := 0
 
-	s.activeMakerOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	s.activeMakerOrders = bbgo.NewActiveOrderBook(s.Symbol)
 	s.activeMakerOrders.BindStream(session.UserDataStream)
 
 	s.orderStore = bbgo.NewOrderStore(s.Symbol)
@@ -171,6 +182,8 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	session.UserDataStream.OnStart(func() {
 		log.Infof("connected")
 	})
+
+	s.T = 20
 
 	session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {
 
@@ -193,12 +206,15 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		// opening gap
 		ogap := kline.Open.Div(s.prevClose)
 
+		driftVal := drift.Last()
+
 		log.Infof("corr: %f, rev: %f, a150: %f, mom: %f, ogap: %f", corr.Float64(), rev.Float64(), a150.Float64(), mom.Float64(), ogap.Float64())
 		s.Alpha[0] = append(s.Alpha[0], corr.Float64())
 		s.Alpha[1] = append(s.Alpha[1], rev.Float64())
 		s.Alpha[2] = append(s.Alpha[2], a150.Float64())
 		s.Alpha[3] = append(s.Alpha[3], mom.Float64())
 		s.Alpha[4] = append(s.Alpha[4], ogap.Float64())
+		s.Alpha[5] = append(s.Alpha[5], driftVal)
 
 		// s.Alpha[5] = append(s.Alpha[4], 1.0) // constant
 
@@ -207,7 +223,6 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		log.Infof("Current Return: %f", s.Ret[len(s.Ret)-1])
 
 		// accumulate enough data for cross-sectional regression, not time-series regression
-		s.T = 20
 		if preCompute < int(s.T)+1 {
 			preCompute++
 		} else {
@@ -221,10 +236,18 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			r.SetVar(2, "A150")
 			r.SetVar(3, "Mom")
 			r.SetVar(4, "OGap")
+			r.SetVar(5, "Drift")
 			var rdp regression.DataPoints
 			for i := 1; i <= int(s.T); i++ {
 				// alphas[t-1], previous alphas, dot not take current alpha into account, will cause look-ahead bias
-				as := []float64{s.Alpha[0][len(s.Alpha[0])-(i+2)], s.Alpha[1][len(s.Alpha[1])-(i+2)], s.Alpha[2][len(s.Alpha[2])-(i+2)], s.Alpha[3][len(s.Alpha[3])-(i+2)], s.Alpha[4][len(s.Alpha[4])-(i+2)]}
+				as := []float64{
+					s.Alpha[0][len(s.Alpha[0])-(i+2)],
+					s.Alpha[1][len(s.Alpha[1])-(i+2)],
+					s.Alpha[2][len(s.Alpha[2])-(i+2)],
+					s.Alpha[3][len(s.Alpha[3])-(i+2)],
+					s.Alpha[4][len(s.Alpha[4])-(i+2)],
+					s.Alpha[5][len(s.Alpha[5])-(i+2)],
+				}
 				// alphas[t], current return rate
 				rt := s.Ret[len(s.Ret)-(i+1)]
 				rdp = append(rdp, regression.DataPoint(rt, as))
@@ -234,7 +257,14 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			r.Run()
 			fmt.Printf("Regression formula:\n%v\n", r.Formula)
 			// prediction := r.Coeff(0)*corr.Float64() + r.Coeff(1)*rev.Float64() + r.Coeff(2)*factorzoo.Float64() + r.Coeff(3)*mom.Float64() + r.Coeff(4)
-			prediction, _ := r.Predict([]float64{corr.Float64(), rev.Float64(), a150.Float64(), mom.Float64(), ogap.Float64()})
+			prediction, _ := r.Predict([]float64{
+				corr.Float64(),
+				rev.Float64(),
+				a150.Float64(),
+				mom.Float64(),
+				ogap.Float64(),
+				driftVal,
+			})
 			log.Infof("Predicted Return: %f", prediction)
 
 			s.placeOrders(ctx, orderExecutor, fixedpoint.NewFromFloat(prediction))
