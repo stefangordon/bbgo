@@ -1,12 +1,8 @@
 package bbgo
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"image/png"
-	"io/ioutil"
-	stdlog "log"
 	"math/rand"
 	"os"
 	"strings"
@@ -14,20 +10,13 @@ import (
 	"time"
 
 	"github.com/codingconcepts/env"
-	"github.com/pkg/errors"
-	"github.com/pquerna/otp"
 	log "github.com/sirupsen/logrus"
-	"github.com/slack-go/slack"
 	"github.com/spf13/viper"
-	"gopkg.in/tucnak/telebot.v2"
 
 	exchange2 "github.com/c9s/bbgo/pkg/exchange"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/interact"
-	"github.com/c9s/bbgo/pkg/notifier/slacknotifier"
-	"github.com/c9s/bbgo/pkg/notifier/telegramnotifier"
 	"github.com/c9s/bbgo/pkg/service"
-	"github.com/c9s/bbgo/pkg/slack/slacklog"
 	"github.com/c9s/bbgo/pkg/types"
 	"github.com/c9s/bbgo/pkg/util"
 )
@@ -301,6 +290,38 @@ func (environ *Environment) ConfigurePersistence(conf *PersistenceConfig) error 
 	return nil
 }
 
+func (environ *Environment) ConfigureNotificationSystem(userConfig *Config) error {
+	var persistence = PersistenceServiceFacade.Get()
+
+	err := setupInteraction(persistence)
+	if err != nil {
+		return err
+	}
+
+	// setup slack
+	slackToken := viper.GetString("slack-token")
+	if len(slackToken) > 0 && userConfig.Notifications != nil {
+		setupSlack(userConfig, slackToken, persistence)
+	}
+
+	// check if telegram bot token is defined
+	telegramBotToken := viper.GetString("telegram-bot-token")
+	if len(telegramBotToken) > 0 {
+		if err := setupTelegram(userConfig, telegramBotToken, persistence); err != nil {
+			return err
+		}
+	}
+
+	if userConfig.Notifications != nil {
+		if err := ConfigureNotificationRouting(environ, userConfig.Notifications); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+
 // ConfigureNotificationRouting configures the notification rules
 // for symbol-based routes, we should register the same symbol rules for each session.
 // for session-based routes, we should set the fixed callbacks for each session
@@ -447,24 +468,9 @@ func ConfigureNotificationRouting(environ *Environment, conf *NotificationConfig
 				return
 			})
 
+		default:
+
 		}
-
-		// currently, not used
-		// FIXME: this is causing cyclic import
-		/*
-			switch conf.Routing.PnL {
-			case "$symbol":
-				environ.ObjectChannelRouter.Route(func(obj interface{}) (channel string, ok bool) {
-					report, matched := obj.(*pnl.AverageCostPnlReport)
-					if !matched {
-						return
-					}
-					channel, ok = environ.SymbolChannelRouter.Route(report.Symbol)
-					return
-				})
-			}
-		*/
-
 	}
 	return nil
 }
@@ -792,37 +798,6 @@ func (environ *Environment) syncSession(ctx context.Context, session *ExchangeSe
 	return environ.SyncService.SyncSessionSymbols(ctx, session.Exchange, environ.syncStartTime, symbols...)
 }
 
-func (environ *Environment) ConfigureNotificationSystem(userConfig *Config) error {
-	var persistence = PersistenceServiceFacade.Get()
-
-	err := environ.setupInteraction(persistence)
-	if err != nil {
-		return err
-	}
-
-	// setup slack
-	slackToken := viper.GetString("slack-token")
-	if len(slackToken) > 0 && userConfig.Notifications != nil {
-		setupSlack(userConfig, slackToken, persistence)
-	}
-
-	// check if telegram bot token is defined
-	telegramBotToken := viper.GetString("telegram-bot-token")
-	if len(telegramBotToken) > 0 {
-		if err := setupTelegram(userConfig, telegramBotToken, persistence); err != nil {
-			return err
-		}
-	}
-
-	if userConfig.Notifications != nil {
-		if err := ConfigureNotificationRouting(environ, userConfig.Notifications); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // getAuthStoreID returns the authentication store id
 // if telegram bot token is defined, the bot id will be used.
 // if not, env var $USER will be used.
@@ -840,293 +815,6 @@ func getAuthStoreID() string {
 	}
 
 	return "default"
-}
-
-func (environ *Environment) setupInteraction(persistence service.PersistenceService) error {
-	var otpQRCodeImagePath = "otp.png"
-	var key *otp.Key
-	var keyURL string
-	var authStore = environ.getAuthStore(persistence)
-
-	if v, ok := util.GetEnvVarBool("FLUSH_OTP_KEY"); v && ok {
-		log.Warnf("flushing otp key...")
-		if err := authStore.Reset(); err != nil {
-			return err
-		}
-	}
-
-	if err := authStore.Load(&keyURL); err != nil {
-		log.Warnf("telegram session not found, generating new one-time password key for new telegram session...")
-
-		newKey, err := setupNewOTPKey(otpQRCodeImagePath)
-		if err != nil {
-			return errors.Wrapf(err, "failed to setup totp (time-based one time password) key")
-		}
-
-		key = newKey
-		keyURL = key.URL()
-		if err := authStore.Save(keyURL); err != nil {
-			return err
-		}
-
-		printOtpAuthGuide(otpQRCodeImagePath)
-
-	} else if keyURL != "" {
-		key, err = otp.NewKeyFromURL(keyURL)
-		if err != nil {
-			log.WithError(err).Errorf("can not load otp key from url: %s, generating new otp key", keyURL)
-
-			newKey, err := setupNewOTPKey(otpQRCodeImagePath)
-			if err != nil {
-				return errors.Wrapf(err, "failed to setup totp (time-based one time password) key")
-			}
-
-			key = newKey
-			keyURL = key.URL()
-			if err := authStore.Save(keyURL); err != nil {
-				return err
-			}
-
-			printOtpAuthGuide(otpQRCodeImagePath)
-		} else {
-			log.Infof("otp key loaded: %s", util.MaskKey(key.Secret()))
-			printOtpAuthGuide(otpQRCodeImagePath)
-		}
-	}
-
-	authStrict := false
-	authMode := interact.AuthModeToken
-	authToken := viper.GetString("telegram-bot-auth-token")
-
-	if authToken != "" && key != nil {
-		authStrict = true
-	} else if authToken != "" {
-		authMode = interact.AuthModeToken
-	} else if key != nil {
-		authMode = interact.AuthModeOTP
-	}
-
-	if authMode == interact.AuthModeToken {
-		log.Debugf("found interaction auth token, using token mode for authorization...")
-		printAuthTokenGuide(authToken)
-	}
-
-	interact.AddCustomInteraction(&interact.AuthInteract{
-		Strict: authStrict,
-		Mode:   authMode,
-		Token:  authToken, // can be empty string here
-		// pragma: allowlist nextline secret
-		OneTimePasswordKey: key, // can be nil here
-	})
-	return nil
-}
-
-func (environ *Environment) getAuthStore(persistence service.PersistenceService) service.Store {
-	id := getAuthStoreID()
-	return persistence.NewStore("bbgo", "auth", id)
-}
-
-func setupSlack(userConfig *Config, slackToken string, persistence service.PersistenceService) {
-	conf := userConfig.Notifications.Slack
-	if conf == nil {
-		return
-	}
-
-	if !strings.HasPrefix(slackToken, "xoxb-") {
-		log.Error("SLACK_BOT_TOKEN must have the prefix \"xoxb-\".")
-		return
-	}
-
-	// app-level token (for specific api)
-	slackAppToken := viper.GetString("slack-app-token")
-	if len(slackAppToken) > 0 && !strings.HasPrefix(slackAppToken, "xapp-") {
-		log.Errorf("SLACK_APP_TOKEN must have the prefix \"xapp-\".")
-		return
-	}
-
-	if conf.ErrorChannel != "" {
-		log.Debugf("found slack configured, setting up log hook...")
-		log.AddHook(slacklog.NewLogHook(slackToken, conf.ErrorChannel))
-	}
-
-	log.Debugf("adding slack notifier with default channel: %s", conf.DefaultChannel)
-
-	var slackOpts = []slack.Option{
-		slack.OptionLog(stdlog.New(os.Stdout, "api: ", stdlog.Lshortfile|stdlog.LstdFlags)),
-	}
-
-	if len(slackAppToken) > 0 {
-		slackOpts = append(slackOpts, slack.OptionAppLevelToken(slackAppToken))
-	}
-
-	if b, ok := util.GetEnvVarBool("DEBUG_SLACK"); ok {
-		slackOpts = append(slackOpts, slack.OptionDebug(b))
-	}
-
-	var client = slack.New(slackToken, slackOpts...)
-
-	var notifier = slacknotifier.New(client, conf.DefaultChannel)
-	Notification.AddNotifier(notifier)
-
-	// allocate a store, so that we can save the chatID for the owner
-	var messenger = interact.NewSlack(client)
-
-	var sessions = interact.SlackSessionMap{}
-	var sessionStore = persistence.NewStore("bbgo", "slack")
-	if err := sessionStore.Load(&sessions); err != nil {
-
-	} else {
-		// TODO: this is not necessary for slack, but we should find a way to restore the sessions
-		/*
-			for _, session := range sessions {
-				if session.IsAuthorized() {
-					// notifier.AddChat(session.Chat)
-				}
-			}
-			messenger.RestoreSessions(sessions)
-			messenger.OnAuthorized(func(userSession *interact.SlackSession) {
-				if userSession.IsAuthorized() {
-					// notifier.AddChat(userSession.Chat)
-				}
-			})
-		*/
-	}
-
-	interact.AddMessenger(messenger)
-}
-
-func setupTelegram(userConfig *Config, telegramBotToken string, persistence service.PersistenceService) error {
-	tt := strings.Split(telegramBotToken, ":")
-	telegramID := tt[0]
-
-	bot, err := telebot.NewBot(telebot.Settings{
-		// You can also set custom API URL.
-		// If field is empty it equals to "https://api.telegram.org".
-		// URL: "http://195.129.111.17:8012",
-		Token:  telegramBotToken,
-		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
-	})
-
-	if err != nil {
-		return err
-	}
-
-	var opts []telegramnotifier.Option
-	if userConfig.Notifications != nil && userConfig.Notifications.Telegram != nil {
-		log.Infof("telegram broadcast is enabled")
-		opts = append(opts, telegramnotifier.UseBroadcast())
-	}
-
-	var notifier = telegramnotifier.New(bot, opts...)
-	Notification.AddNotifier(notifier)
-
-	// allocate a store, so that we can save the chatID for the owner
-	var messenger = interact.NewTelegram(bot)
-
-	var sessions = interact.TelegramSessionMap{}
-	var sessionStore = persistence.NewStore("bbgo", "telegram", telegramID)
-	if err := sessionStore.Load(&sessions); err != nil {
-		if err != service.ErrPersistenceNotExists {
-			log.WithError(err).Errorf("unexpected persistence error")
-		}
-	} else {
-		for _, session := range sessions {
-			if session.IsAuthorized() {
-				notifier.AddChat(session.Chat)
-			}
-		}
-
-		// you must restore the session after the notifier updates
-		messenger.RestoreSessions(sessions)
-	}
-
-	messenger.OnAuthorized(func(userSession *interact.TelegramSession) {
-		if userSession.IsAuthorized() {
-			notifier.AddChat(userSession.Chat)
-		}
-
-		log.Infof("user session %d got authorized, saving telegram sessions...", userSession.User.ID)
-		if err := sessionStore.Save(messenger.Sessions()); err != nil {
-			log.WithError(err).Errorf("telegram session save error")
-		}
-	})
-
-	interact.AddMessenger(messenger)
-	return nil
-}
-
-func writeOTPKeyAsQRCodePNG(key *otp.Key, imagePath string) error {
-	// Convert TOTP key into a PNG
-	var buf bytes.Buffer
-	img, err := key.Image(512, 512)
-	if err != nil {
-		return err
-	}
-
-	if err := png.Encode(&buf, img); err != nil {
-		return err
-	}
-
-	if err := ioutil.WriteFile(imagePath, buf.Bytes(), 0644); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// setupNewOTPKey generates a new otp key and save the secret as a qrcode image
-func setupNewOTPKey(qrcodeImagePath string) (*otp.Key, error) {
-	key, err := service.NewDefaultTotpKey()
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to setup totp (time-based one time password) key")
-	}
-
-	printOtpKey(key)
-
-	if err := writeOTPKeyAsQRCodePNG(key, qrcodeImagePath); err != nil {
-		return nil, err
-	}
-
-	return key, nil
-}
-
-func printOtpKey(key *otp.Key) {
-	fmt.Println("")
-	fmt.Println("====================================================================")
-	fmt.Println("               PLEASE STORE YOUR OTP KEY SAFELY                     ")
-	fmt.Println("====================================================================")
-	fmt.Printf("  Issuer:       %s\n", key.Issuer())
-	fmt.Printf("  AccountName:  %s\n", key.AccountName())
-	fmt.Printf("  Secret:       %s\n", key.Secret())
-	fmt.Printf("  Key URL:      %s\n", key.URL())
-	fmt.Println("====================================================================")
-	fmt.Println("")
-}
-
-func printOtpAuthGuide(qrcodeImagePath string) {
-	fmt.Printf(`
-To scan your OTP QR code, please run the following command:
-	
-	open %s
-
-For telegram, send the auth command with the generated one-time password to the bbo bot you created to enable the notification:
-
-	/auth
-
-`, qrcodeImagePath)
-}
-
-func printAuthTokenGuide(token string) {
-	fmt.Printf(`
-For telegram, send the following command to the bbgo bot you created to enable the notification:
-
-	/auth
-
-And then enter your token
-
-	%s
-
-`, token)
 }
 
 func (session *ExchangeSession) getSessionSymbols(defaultSymbols ...string) ([]string, error) {
