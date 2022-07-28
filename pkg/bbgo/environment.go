@@ -304,14 +304,16 @@ func (environ *Environment) ConfigurePersistence(conf *PersistenceConfig) error 
 // ConfigureNotificationRouting configures the notification rules
 // for symbol-based routes, we should register the same symbol rules for each session.
 // for session-based routes, we should set the fixed callbacks for each session
-func (environ *Environment) ConfigureNotificationRouting(conf *NotificationConfig) error {
+func ConfigureNotificationRouting(environ *Environment, conf *NotificationConfig) error {
 	// configure routing here
 	if conf.SymbolChannels != nil {
 		Notification.SymbolChannelRouter.AddRoute(conf.SymbolChannels)
 	}
+
 	if conf.SessionChannels != nil {
 		Notification.SessionChannelRouter.AddRoute(conf.SessionChannels)
 	}
+
 	if conf.Routing != nil {
 		// configure passive object notification routing
 		switch conf.Routing.Trade {
@@ -358,6 +360,16 @@ func (environ *Environment) ConfigureNotificationRouting(conf *NotificationConfi
 			for _, session := range environ.sessions {
 				session.UserDataStream.OnTradeUpdate(handler)
 			}
+
+		default:
+			// use same handler for each session
+			handler := func(trade types.Trade) {
+				Notify(&trade)
+			}
+			for _, session := range environ.sessions {
+				session.UserDataStream.OnTradeUpdate(handler)
+			}
+
 		}
 
 		switch conf.Routing.Order {
@@ -408,6 +420,15 @@ func (environ *Environment) ConfigureNotificationRouting(conf *NotificationConfi
 			for _, session := range environ.sessions {
 				session.UserDataStream.OnOrderUpdate(handler)
 			}
+
+		default:
+			handler := func(order types.Order) {
+				Notify(&order)
+			}
+			for _, session := range environ.sessions {
+				session.UserDataStream.OnOrderUpdate(handler)
+			}
+
 		}
 
 		switch conf.Routing.SubmitOrder {
@@ -782,19 +803,19 @@ func (environ *Environment) ConfigureNotificationSystem(userConfig *Config) erro
 	// setup slack
 	slackToken := viper.GetString("slack-token")
 	if len(slackToken) > 0 && userConfig.Notifications != nil {
-		environ.setupSlack(userConfig, slackToken, persistence)
+		setupSlack(userConfig, slackToken, persistence)
 	}
 
 	// check if telegram bot token is defined
 	telegramBotToken := viper.GetString("telegram-bot-token")
 	if len(telegramBotToken) > 0 {
-		if err := environ.setupTelegram(userConfig, telegramBotToken, persistence); err != nil {
+		if err := setupTelegram(userConfig, telegramBotToken, persistence); err != nil {
 			return err
 		}
 	}
 
 	if userConfig.Notifications != nil {
-		if err := environ.ConfigureNotificationRouting(userConfig.Notifications); err != nil {
+		if err := ConfigureNotificationRouting(environ, userConfig.Notifications); err != nil {
 			return err
 		}
 	}
@@ -905,7 +926,7 @@ func (environ *Environment) getAuthStore(persistence service.PersistenceService)
 	return persistence.NewStore("bbgo", "auth", id)
 }
 
-func (environ *Environment) setupSlack(userConfig *Config, slackToken string, persistence service.PersistenceService) {
+func setupSlack(userConfig *Config, slackToken string, persistence service.PersistenceService) {
 	conf := userConfig.Notifications.Slack
 	if conf == nil {
 		return
@@ -974,7 +995,7 @@ func (environ *Environment) setupSlack(userConfig *Config, slackToken string, pe
 	interact.AddMessenger(messenger)
 }
 
-func (environ *Environment) setupTelegram(userConfig *Config, telegramBotToken string, persistence service.PersistenceService) error {
+func setupTelegram(userConfig *Config, telegramBotToken string, persistence service.PersistenceService) error {
 	tt := strings.Split(telegramBotToken, ":")
 	telegramID := tt[0]
 
