@@ -470,6 +470,17 @@ func Load(configFile string, loadStrategies bool) (*Config, error) {
 		}
 	}
 
+	// setup default notification config
+	if config.Notifications == nil {
+		config.Notifications = &NotificationConfig{
+			Routing: &SlackNotificationRouting{
+				Trade:       "$session",
+				Order:       "$silent",
+				SubmitOrder: "$silent",
+			},
+		}
+	}
+
 	stash, err := loadStash(content)
 	if err != nil {
 		return nil, err

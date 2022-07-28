@@ -772,18 +772,6 @@ func (environ *Environment) syncSession(ctx context.Context, session *ExchangeSe
 }
 
 func (environ *Environment) ConfigureNotificationSystem(userConfig *Config) error {
-
-	// setup default notification config
-	if userConfig.Notifications == nil {
-		userConfig.Notifications = &NotificationConfig{
-			Routing: &SlackNotificationRouting{
-				Trade:       "$session",
-				Order:       "$silent",
-				SubmitOrder: "$silent",
-			},
-		}
-	}
-
 	var persistence = PersistenceServiceFacade.Get()
 
 	err := environ.setupInteraction(persistence)
