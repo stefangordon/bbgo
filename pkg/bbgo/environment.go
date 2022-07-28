@@ -563,7 +563,6 @@ func (environ *Environment) BindSync(config *SyncConfig) {
 }
 
 func (environ *Environment) Connect(ctx context.Context) error {
-	log.Debugf("starting interaction...")
 	if err := interact.Start(ctx); err != nil {
 		return err
 	}
